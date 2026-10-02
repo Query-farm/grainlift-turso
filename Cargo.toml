@@ -1,0 +1,40 @@
+# Copyright (c) 2026 Query Farm LLC
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "grainlift-turso"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+description = "An ADBC service for Turso databases, built with the Grainlift server library"
+repository = "https://github.com/Query-farm/grainlift-turso"
+publish = false
+
+# Keep this crate independent when it is checked out beneath another workspace.
+[workspace]
+
+[dependencies]
+# Use the same arrow-adbc revision as grainlift-server so the ADBC types match.
+adbc_core = { git = "https://github.com/apache/arrow-adbc.git", rev = "c942d481c6e083040c68676e3dd454dad89503e9" }
+arrow-array = "60"
+arrow-cast = "60"
+arrow-json = "60"
+arrow-schema = "60"
+# Same version as turso_serverless, for streamed Turso Cloud results.
+reqwest = { version = "0.13", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+# grainlift v0.4.2; CI builds the native ADBC driver from this same revision.
+grainlift-server = { git = "https://github.com/Query-farm/grainlift.git", rev = "07850074d5c358ce8809fadddd9223d4ea0854d2" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# The embedded Turso Database engine: local files, in process.
+turso = "0.8.1"
+# Turso Cloud over its SQL-over-HTTP protocol.
+turso_serverless = "0.1.3"
+
+[dev-dependencies]
+adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc.git", rev = "c942d481c6e083040c68676e3dd454dad89503e9" }
+tempfile = "3"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
+vgi-rpc = { version = "0.28.2", default-features = false }

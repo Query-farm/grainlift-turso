@@ -1,0 +1,91 @@
+# Copyright (c) 2026 Query Farm LLC
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Find the Grainlift revision pinned in Cargo.lock
+        id: grainlift
+        shell: bash
+        run: |
+          rev=$(sed -n 's|^source = "git+https://github.com/Query-farm/grainlift.git?rev=\([0-9a-f]\{40\}\)#.*|\1|p' Cargo.lock | head -n 1)
+          test -n "$rev" || { echo "grainlift-server must be pinned to a Git revision" >&2; exit 1; }
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+      - name: Check out the same revision for the native driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Query-farm/grainlift
+          ref: ${{ steps.grainlift.outputs.rev }}
+          path: native-driver
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            .
+            native-driver
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: 0.11.7
+      - name: Check formatting and lints
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+      - name: Build the native ADBC driver
+        working-directory: native-driver
+        run: cargo build --locked -p adbc-driver-grainlift
+      - name: Locate the native driver
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            macOS) driver="$PWD/native-driver/target/debug/libadbc_driver_grainlift.dylib" ;;
+            Linux) driver="$PWD/native-driver/target/debug/libadbc_driver_grainlift.so" ;;
+            *) exit 1 ;;
+          esac
+          test -f "$driver"
+          echo "GRAINLIFT_DRIVER=$driver" >> "$GITHUB_ENV"
+      - name: Unit, backend and native-driver tests
+        env:
+          GRAINLIFT_REQUIRE_NATIVE: '1'
+          # The Turso Cloud tests run when these repository secrets exist and
+          # skip otherwise (forks and pull requests from them never see them).
+          TURSO_TEST_DATABASE_URL: ${{ secrets.TURSO_TEST_DATABASE_URL }}
+          TURSO_TEST_AUTH_TOKEN: ${{ secrets.TURSO_TEST_AUTH_TOKEN }}
+          TURSO_TEST_READ_ONLY_TOKEN: ${{ secrets.TURSO_TEST_READ_ONLY_TOKEN }}
+        run: cargo test --locked
+      - name: Run the shipped SQL example through Haybarn
+        shell: bash
+        env:
+          GRAINLIFT_TOKEN: ci-example-token
+        run: |
+          uv tool install 'haybarn-cli==1.5.5rc1'
+          cargo build --locked --release
+          TURSO_DATABASE_URL="$RUNNER_TEMP/example.db" ./target/release/grainlift-turso &
+          server=$!
+          for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null && break; sleep 0.2; done
+          haybarn -bail < examples/query.sql | tee "$RUNNER_TEMP/example.out"
+          kill "$server"
+          grep -q 'Oslo' "$RUNNER_TEMP/example.out"
+          grep -q '710000' "$RUNNER_TEMP/example.out"

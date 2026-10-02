@@ -1,0 +1,27 @@
+grainlift-turso
+Copyright (c) 2026 Query Farm LLC - https://query.farm
+
+This product is licensed under the Apache License, Version 2.0. See LICENSE.
+
+------------------------------------------------------------------------------
+
+Turso
+
+This software connects to Turso databases through Turso's own Rust clients,
+the `turso` and `turso_serverless` crates, which are licensed under the MIT
+License by their authors. Data stored in a Turso Cloud database is the
+database owner's, and use of Turso Cloud is subject to Turso's terms:
+
+    https://turso.tech/terms-of-service
+
+Neither this software nor Query Farm LLC is affiliated with, endorsed by, or
+sponsored by Turso. "Turso" is a trademark of its respective owner and is used
+here only to describe what this software connects to.
+
+------------------------------------------------------------------------------
+
+Grainlift logo
+
+docs/grainlift-logo.svg is copied from the Grainlift project
+(https://github.com/Query-farm/grainlift), Copyright (c) 2026 ADBC Drivers
+Contributors and Query Farm LLC, licensed under the Apache License, Version 2.0.
