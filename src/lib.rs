@@ -37,7 +37,7 @@ use grainlift_server::backend::{Backend, BackendConnection};
 use grainlift_server::config::TargetConfig;
 
 pub use connection::TursoConnection;
-pub use db::{Limits, Location};
+pub use db::{Limits, Location, TransactionMode};
 pub use statement::TursoStatement;
 
 use crate::db::{Database, Runtime};
@@ -65,6 +65,8 @@ pub struct TargetSpec {
     pub allow_client_auth_token: bool,
     /// Per-operation limits.
     pub limits: Limits,
+    /// How transactions begin.
+    pub transactions: TransactionMode,
 }
 
 impl TargetSpec {
@@ -74,6 +76,7 @@ impl TargetSpec {
             location,
             allow_client_auth_token: true,
             limits: Limits::default(),
+            transactions: TransactionMode::default(),
         }
     }
 
@@ -115,6 +118,15 @@ impl TursoBackend {
         for (name, spec) in targets {
             let database = Database::open(&spec.location, &runtime)
                 .map_err(|failure| for_target(&name, "could not be opened", failure))?;
+            if spec.transactions == TransactionMode::Concurrent && !spec.location.is_remote() {
+                return Err(Error::with_message_and_status(
+                    format!(
+                        "Target {name:?}: concurrent transactions need a Turso Cloud database on \
+                         the Turso Database engine"
+                    ),
+                    Status::InvalidArguments,
+                ));
+            }
             let target = Target { spec, database };
             if !target.spec.requires_client_token() {
                 probe(&target, &runtime)
@@ -271,11 +283,31 @@ fn for_target(name: &str, what: &str, failure: Error) -> Error {
     error
 }
 
+/// Check that a target answers, and that a `concurrent` target's database
+/// supports `BEGIN CONCURRENT` (a libSQL database refuses it).
 fn probe(target: &Target, runtime: &Runtime) -> Result<()> {
-    let connection = target.database.connect(runtime, target.spec.limits)?;
-    let result = connection.execute("SELECT 1", Vec::new());
+    let connection =
+        target
+            .database
+            .connect(runtime, target.spec.limits, target.spec.transactions)?;
+    let mut result = connection.execute("SELECT 1", Vec::new()).map(drop);
+    if result.is_ok() && target.spec.transactions == TransactionMode::Concurrent {
+        result = connection
+            .begin()
+            .and_then(|()| connection.execute("ROLLBACK", Vec::new()).map(drop))
+            .map_err(|failure| {
+                Error::with_message_and_status(
+                    format!(
+                        "transaction_mode = \"concurrent\" needs a database on the Turso \
+                         Database engine (turso db create --tursodb): {}",
+                        failure.message
+                    ),
+                    Status::InvalidArguments,
+                )
+            });
+    }
     connection.close();
-    result.map(drop)
+    result
 }
 
 impl Backend for TursoBackend {
@@ -293,7 +325,8 @@ impl Backend for TursoBackend {
             Error::with_message_and_status("The target is not configured", Status::NotFound)
         })?;
         let database = self.database_for(entry, database_options)?;
-        let connection = database.connect(&self.runtime, entry.spec.limits)?;
+        let connection =
+            database.connect(&self.runtime, entry.spec.limits, entry.spec.transactions)?;
         let mut connection = TursoConnection::new(Session::new(connection));
         for (key, value) in connection_options {
             connection.set_option(&key, value)?;

@@ -90,6 +90,56 @@ jobs:
           grep -q 'Oslo' "$RUNNER_TEMP/example.out"
           grep -q '710000' "$RUNNER_TEMP/example.out"
 
+  tursodb:
+    name: Turso Cloud, Turso Database engine (preview)
+    # The engine's concurrent writes are an early preview on Turso Cloud; a
+    # change there must not block merges. One job only: on this engine any
+    # schema change aborts other connections' concurrent transactions, so two
+    # jobs sharing the database would interfere.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Find the Grainlift revision pinned in Cargo.lock
+        id: grainlift
+        shell: bash
+        run: |
+          rev=$(sed -n 's|^source = "git+https://github.com/Query-farm/grainlift.git?rev=\([0-9a-f]\{40\}\)#.*|\1|p' Cargo.lock | head -n 1)
+          test -n "$rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+      - name: Check out the same revision for the native driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Query-farm/grainlift
+          ref: ${{ steps.grainlift.outputs.rev }}
+          path: native-driver
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            .
+            native-driver
+      - name: Build the native ADBC driver
+        working-directory: native-driver
+        run: cargo build --locked -p adbc-driver-grainlift
+      - name: Cloud and concurrent-transaction tests
+        env:
+          GRAINLIFT_REQUIRE_NATIVE: '1'
+          TURSO_TEST_DATABASE_URL: ${{ secrets.TURSO_TEST_TURSODB_URL }}
+          TURSO_TEST_AUTH_TOKEN: ${{ secrets.TURSO_TEST_TURSODB_AUTH_TOKEN }}
+          TURSO_TEST_READ_ONLY_TOKEN: ${{ secrets.TURSO_TEST_TURSODB_READ_ONLY_TOKEN }}
+          TURSO_TEST_TURSODB_URL: ${{ secrets.TURSO_TEST_TURSODB_URL }}
+          TURSO_TEST_TURSODB_AUTH_TOKEN: ${{ secrets.TURSO_TEST_TURSODB_AUTH_TOKEN }}
+        run: |
+          export GRAINLIFT_DRIVER="$PWD/native-driver/target/debug/libadbc_driver_grainlift.so"
+          cargo test --locked --test cloud --test concurrent
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

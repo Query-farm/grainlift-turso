@@ -40,6 +40,15 @@ The first release: a Grainlift ADBC service for Turso databases.
   tracing.
 - A Dockerfile for a non-root container image.
 
+### Turso Cloud's Turso Database engine
+
+- Tested against Turso Cloud databases on both libSQL and the Turso Database
+  engine.
+- `transaction_mode = "concurrent"` opens transactions with
+  `BEGIN CONCURRENT` for parallel writers; conflicts and schema-change aborts
+  report the retryable SQLSTATE `40001`.
+- A transaction Turso rolled back on its own is never reported as committed.
+
 ### Performance
 
 - Turso Cloud results stream from the cursor endpoint: 100 MB read at 40 MB

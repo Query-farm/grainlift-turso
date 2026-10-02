@@ -171,6 +171,7 @@ read_only = true
 | `read_only` | `false` | Open a local file read-only. Two targets may not share a file. |
 | `operation_timeout_seconds` | `60` | Longest one operation may run. Must be shorter than `server.driver_operation_timeout_seconds`. |
 | `busy_timeout_ms` | `5000` | How long a local write waits for another writer's lock |
+| `transaction_mode` | `deferred` | `deferred` opens transactions with `BEGIN`; `concurrent` with `BEGIN CONCURRENT`, for Turso Cloud databases on the Turso Database engine (see below) |
 
 The host provides what `grainlift-server` does: static bearer tokens or JWT
 validation (`[auth.jwt]`), OAuth discovery for browser and CLI sign-in
@@ -302,6 +303,29 @@ result slowly is never cut off between batches. That is also why the engine's
 own per-statement timeout is not used: it starts at a statement's first step
 and would interrupt a slow reader.
 
+**Concurrent writes on Turso Cloud's new engine.** Turso Cloud can run a
+database on the Turso Database engine instead of libSQL (`turso db create
+--tursodb`, after enabling it under the organization's Settings → General).
+That engine offers `BEGIN CONCURRENT`: transactions write in parallel, and
+conflicts are detected per row. With `transaction_mode = "concurrent"`, every
+transaction this service opens (a client's, with autocommit off, and its own
+atomic multi-row writes) begins that way. Startup refuses the setting for a
+libSQL database or a local file.
+
+A transaction can then lose to another: it wrote a row another committed
+first, or another connection changed the schema while it ran. Turso rolls the
+loser back at once, and the client gets SQLSTATE `40001`, the standard signal
+to retry the transaction. Measured against Turso Cloud: two writers on
+different rows both commit, and on the same row the second fails immediately
+at its `UPDATE`. With plain `BEGIN` on that engine, writers are serialized, and
+Turso rolls back an idle lock holder ("the stream was idle for too long").
+
+**A transaction Turso ended is never reported as committed.** When Turso rolls a
+transaction back on its own (a conflict, or an expired Turso Cloud stream), a
+`commit` that finds nothing to commit would otherwise succeed and silently
+save nothing. The session remembers the transaction it opened, so the client's
+next statement or `commit` fails with SQLSTATE `40001` instead.
+
 **Read-only local files are enforced twice.** Turso shares one open database
 per path within a process and ignores a second opener's read-only flag, so a
 read-only target opened while the same file was open read-write elsewhere in
@@ -382,6 +406,7 @@ and SQLSTATEs, so clients can tell a bad query from a lost connection:
 | read-only token or file | `UNAUTHORIZED` | `25006` |
 | rejected or expired Turso token | `UNAUTHENTICATED` | `28000` |
 | busy (another writer held the lock past `busy_timeout_ms`) | `TIMEOUT` | `40001` |
+| concurrent-transaction conflict, or a transaction Turso rolled back | `INVALID_STATE` | `40001` |
 | operation deadline expired | `TIMEOUT` | `HYT00` |
 | cancelled | `CANCELLED` | `HY008` |
 | network failure | `IO` | `58000` |
@@ -435,7 +460,10 @@ development host) opens it read-only.
   on a timer rather than queueing writers fairly, so under heavy write
   contention a writer can still fail with a retryable busy `TIMEOUT`. Clients
   should retry those; nothing the failed statement attempted is committed. A
-  32-client, two-minute soak test exercises exactly this.
+  32-client, two-minute soak test exercises exactly this. On Turso Cloud, a
+  Turso Database engine database with `transaction_mode = "concurrent"` lifts
+  the limit. The embedded engine's equivalent is still experimental, so local
+  files do not offer it yet.
 - **An interrupted statement inside a transaction** may leave the transaction
   open or rolled back, as in SQLite; roll back and retry.
 - **Idle Turso Cloud transactions expire** with their server-side stream.
@@ -444,8 +472,9 @@ development host) opens it read-only.
 - **Through `adbc_scanner`'s `ATTACH`,** tables created after attaching appear
   only once its catalog cache is cleared, and `DROP TABLE` is not supported;
   use `adbc_execute` for DDL.
-- **Turso Cloud's newer engine is untested.** The Cloud tests ran against a
-  libSQL-backed database. `turso_serverless` speaks the same protocol to both.
+- **Concurrent writes are a Turso Cloud preview.** The Cloud suite passes
+  against both engines, but Turso calls the new engine's concurrent writes an
+  early preview, so CI runs those tests in a job that does not block merges.
 
 ## Developing
 
@@ -490,7 +519,8 @@ cargo test --locked
 | [`tests/native.rs`](tests/native.rs) | 5 | the native driver over HTTP, through the C ABI |
 | [`tests/host.rs`](tests/host.rs) | 3 | the production host and the `serve` and `check` commands, including SIGTERM |
 | [`tests/soak.rs`](tests/soak.rs) | 1 | many concurrent clients doing mixed work; exact totals and no leaked sessions |
-| [`tests/cloud.rs`](tests/cloud.rs) | 4 | a real Turso Cloud database |
+| [`tests/cloud.rs`](tests/cloud.rs) | 5 | a real Turso Cloud database, on either engine |
+| [`tests/concurrent.rs`](tests/concurrent.rs) | 1 | concurrent transactions on the Turso Database engine: parallel writers, conflicts, rollbacks, schema changes |
 
 The Turso Cloud deadline and cancellation tests use a local server that
 accepts connections and never answers. The soak test runs for
@@ -503,8 +533,9 @@ retried correctly, and the whole test process (server and clients) peaked at
 The native tests skip unless `GRAINLIFT_DRIVER` names the driver library; set
 `GRAINLIFT_REQUIRE_NATIVE=1` to fail instead. The Cloud tests skip unless
 `TURSO_TEST_DATABASE_URL` and `TURSO_TEST_AUTH_TOKEN` are set, and the
-client-token test also needs `TURSO_TEST_READ_ONLY_TOKEN`. They create and drop
-their own tables.
+client-token test also needs `TURSO_TEST_READ_ONLY_TOKEN`. The concurrent tests
+need `TURSO_TEST_TURSODB_URL` and `TURSO_TEST_TURSODB_AUTH_TOKEN` for a Turso
+Database engine database. They create and drop their own tables.
 
 ## CI
 
@@ -514,7 +545,9 @@ the revision pinned in `Cargo.lock`, and runs every suite with
 `GRAINLIFT_REQUIRE_NATIVE=1`. The Cloud suite runs when the repository's
 `TURSO_TEST_*` secrets are set. It then starts the service and runs
 [`examples/query.sql`](examples/query.sql) through the Haybarn CLI, so the
-example in this README is checked against a live service. Separate jobs build
+example in this README is checked against a live service. A separate job runs
+the Cloud and concurrent-transaction suites against a Turso Database engine
+database; it does not block merges while the engine is in preview. Others build
 the container image and probe a running container (health, readiness, the
 unprivileged user, a clean `docker stop`), and run `cargo audit`, which fails
 on any dependency with a known vulnerability.

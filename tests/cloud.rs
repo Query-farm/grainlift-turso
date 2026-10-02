@@ -317,3 +317,27 @@ fn streamed_and_transactional_queries() {
     drop.set_sql_query(&format!("DROP TABLE {table}")).unwrap();
     drop.execute_update().unwrap();
 }
+
+#[test]
+fn concurrent_transactions_are_refused_for_a_libsql_database() {
+    let Some(url) = setting("TURSO_TEST_DATABASE_URL") else {
+        eprintln!("skipped: TURSO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    if setting("TURSO_TEST_TURSODB_URL").as_deref() == Some(url.as_str()) {
+        eprintln!("skipped: TURSO_TEST_DATABASE_URL is the Turso Database engine database");
+        return;
+    }
+    let spec = grainlift_turso::TargetSpec {
+        transactions: grainlift_turso::TransactionMode::Concurrent,
+        ..grainlift_turso::TargetSpec::new(Location::parse(
+            &url,
+            setting("TURSO_TEST_AUTH_TOKEN"),
+            false,
+        ))
+    };
+    let error = TursoBackend::new([("cloud".to_string(), spec)])
+        .err()
+        .unwrap();
+    assert!(error.message.contains("--tursodb"), "{}", error.message);
+}

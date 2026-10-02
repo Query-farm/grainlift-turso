@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use adbc_core::CancelHandle;
-use adbc_core::error::Result;
+use adbc_core::error::{Error, Result, Status};
 
-use crate::db::Connection;
+use crate::db::{Connection, error};
 
 /// A Turso connection shared by one ADBC connection and its statements.
 ///
@@ -18,9 +18,17 @@ use crate::db::Connection;
 /// commit or rollback. Opening it lazily, rather than right after the
 /// previous commit, keeps an idle client from holding a Turso Cloud stream
 /// open.
+///
+/// Turso can end a transaction itself: a write conflict under
+/// `BEGIN CONCURRENT`, or Turso Cloud expiring an idle stream. The session
+/// remembers the transaction it opened, so the client then gets an error
+/// (from its next statement, or from `commit`) instead of a commit that
+/// silently saves nothing.
 pub struct Session {
     connection: Connection,
     manual: AtomicBool,
+    /// Whether the session opened a transaction that it has not ended.
+    open: AtomicBool,
 }
 
 impl Session {
@@ -28,6 +36,7 @@ impl Session {
         Self {
             connection,
             manual: AtomicBool::new(false),
+            open: AtomicBool::new(false),
         }
     }
 
@@ -44,15 +53,23 @@ impl Session {
     /// none is open. Every statement goes through here.
     pub fn connection(&self) -> Result<&Connection> {
         if self.is_manual() && self.connection.is_autocommit()? {
-            self.connection.execute("BEGIN", Vec::new())?;
+            if self.open.swap(false, Ordering::AcqRel) {
+                return Err(rolled_back());
+            }
+            self.connection.begin()?;
+            self.open.store(true, Ordering::Release);
         }
         Ok(&self.connection)
     }
 
-    /// Run `sql` (`COMMIT` or `ROLLBACK`) if a transaction is open.
+    /// End the open transaction with `COMMIT` or `ROLLBACK`. Committing a
+    /// transaction that Turso already rolled back is an error.
     pub fn end_transaction(&self, sql: &str) -> Result<()> {
+        let opened = self.open.swap(false, Ordering::AcqRel);
         if !self.connection.is_autocommit()? {
             self.connection.execute(sql, Vec::new())?;
+        } else if opened && sql.eq_ignore_ascii_case("COMMIT") {
+            return Err(rolled_back());
         }
         Ok(())
     }
@@ -67,4 +84,15 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.connection.close();
     }
+}
+
+/// The error for a transaction Turso ended before the client did. SQLSTATE
+/// `40001` tells the client to retry it.
+fn rolled_back() -> Error {
+    error(
+        "The transaction was rolled back by Turso before it was committed (a write conflict, \
+         or an idle Turso Cloud stream); retry it",
+        Status::InvalidState,
+        b"40001",
+    )
 }

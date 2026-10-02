@@ -59,6 +59,11 @@ operation_timeout_seconds = 60
 [targets.events]
 url = "libsql://events-myorg.turso.io"
 allow_client_auth_token = true
+# Open transactions with BEGIN CONCURRENT: writers proceed in parallel, and a
+# writer that loses a row conflict gets a retryable error (SQLSTATE 40001).
+# Needs a database on the Turso Database engine (turso db create --tursodb);
+# the default, "deferred", uses BEGIN, one writer at a time.
+transaction_mode = "concurrent"
 
 # A local database file on the embedded Turso Database engine.
 [targets.reference]

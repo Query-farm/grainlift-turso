@@ -113,6 +113,30 @@ impl Default for Limits {
     }
 }
 
+/// How transactions begin.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransactionMode {
+    /// `BEGIN`: one writer at a time.
+    #[default]
+    Deferred,
+    /// `BEGIN CONCURRENT`: writers proceed in parallel, and a transaction that
+    /// writes a row another committed first fails with a retryable conflict.
+    /// Needs a Turso Cloud database on the Turso Database engine
+    /// (`turso db create --tursodb`).
+    Concurrent,
+}
+
+impl TransactionMode {
+    /// The statement that opens a transaction.
+    pub fn begin(self) -> &'static str {
+        match self {
+            Self::Deferred => "BEGIN",
+            Self::Concurrent => "BEGIN CONCURRENT",
+        }
+    }
+}
+
 /// The Tokio runtime that drives Turso Cloud requests and the local
 /// watchdogs.
 ///
@@ -226,7 +250,12 @@ impl Database {
     }
 
     /// Open a new connection, with its own transaction state.
-    pub fn connect(&self, runtime: &Runtime, limits: Limits) -> Result<Connection> {
+    pub fn connect(
+        &self,
+        runtime: &Runtime,
+        limits: Limits,
+        transactions: TransactionMode,
+    ) -> Result<Connection> {
         let (kind, operations) = match self {
             Self::Local(database, read_only) => {
                 let connection = database.connect().map_err(local_error)?;
@@ -254,6 +283,7 @@ impl Database {
             runtime: runtime.clone(),
             operations,
             open: Arc::default(),
+            transactions,
         })
     }
 }
@@ -286,6 +316,7 @@ pub struct Connection {
     operations: Arc<Operations>,
     /// The connection's open local results.
     open: Arc<Mutex<Vec<Weak<StatementSlot>>>>,
+    transactions: TransactionMode,
 }
 
 impl Connection {
@@ -551,6 +582,12 @@ impl Connection {
         }
     }
 
+    /// Open a transaction, as the connection's [`TransactionMode`] says.
+    pub fn begin(&self) -> Result<()> {
+        self.execute(self.transactions.begin(), Vec::new())
+            .map(drop)
+    }
+
     /// Whether no transaction is open.
     pub fn is_autocommit(&self) -> Result<bool> {
         match &self.kind {
@@ -565,7 +602,7 @@ impl Connection {
         if !self.is_autocommit()? {
             return work(self);
         }
-        self.execute("BEGIN", Vec::new())?;
+        self.begin()?;
         match work(self) {
             Ok(value) => {
                 self.execute("COMMIT", Vec::new())?;
@@ -855,6 +892,7 @@ fn classify(kind: &str) -> (Status, &'static [u8; 5]) {
     match kind {
         "constraint" => (Status::Integrity, b"23000"),
         "busy" => (Status::Timeout, b"40001"),
+        "conflict" => (Status::InvalidState, b"40001"),
         "interrupt" => (Status::Cancelled, b"57014"),
         "misuse" => (Status::InvalidState, b"HY010"),
         "readonly" => (Status::Unauthorized, b"25006"),
@@ -871,6 +909,7 @@ fn classify(kind: &str) -> (Status, &'static [u8; 5]) {
 pub fn local_error(failure: TursoError) -> Error {
     let kind = match &failure {
         TursoError::Error(message) if message.contains("query_only mode") => "readonly",
+        TursoError::Error(message) if is_conflict(message) => "conflict",
         TursoError::Constraint(_) => "constraint",
         TursoError::Busy(_) | TursoError::BusySnapshot(_) => "busy",
         TursoError::Interrupt(_) => "interrupt",
@@ -920,15 +959,28 @@ pub fn remote_error(failure: turso_serverless::Error) -> Error {
         };
     }
     let mut kind = remote_kind(&failure);
-    if kind == "error"
-        && failure
-            .to_string()
-            .contains("write operations are forbidden")
-    {
+    let text = failure.to_string();
+    if kind == "error" && text.contains("write operations are forbidden") {
         kind = "readonly";
+    } else if kind == "error" && is_conflict(&text) {
+        kind = "conflict";
     }
     let (status, sqlstate) = classify(kind);
     error(failure.to_string(), status, sqlstate)
+}
+
+/// A `BEGIN CONCURRENT` transaction lost to another: it wrote a row another
+/// committed first, or another connection changed the schema (any `CREATE` or
+/// `DROP`) while it ran. The engine has already rolled the transaction back;
+/// retrying it is correct.
+fn is_conflict(message: &str) -> bool {
+    [
+        "Write-write conflict",
+        "Database schema changed",
+        "Database schema conflict",
+    ]
+    .iter()
+    .any(|wording| message.contains(wording))
 }
 
 fn remote_kind(failure: &turso_serverless::Error) -> &'static str {
@@ -1019,5 +1071,18 @@ mod tests {
             status(E::Constraint("UNIQUE constraint failed".into())),
             Status::Integrity
         );
+        for message in [
+            "Tursodb error: Write-write conflict",
+            "batch statement 0 failed: Tursodb error: Database schema changed",
+            "Tursodb error: Database schema conflict",
+        ] {
+            let conflict = remote_error(E::Error(message.into()));
+            assert_eq!(conflict.status, Status::InvalidState, "{message}");
+            assert_eq!(
+                conflict.sqlstate.map(|byte| byte as u8),
+                *b"40001",
+                "{message}"
+            );
+        }
     }
 }

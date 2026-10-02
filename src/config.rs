@@ -31,7 +31,7 @@ use std::time::Duration;
 use grainlift_server::config::{AuthConfig, ServerConfig, TargetConfig, TcpConfig};
 use serde::Deserialize;
 
-use crate::{AUTH_TOKEN_OPTION, Limits, Location, TargetSpec};
+use crate::{AUTH_TOKEN_OPTION, Limits, Location, TargetSpec, TransactionMode};
 
 /// A production configuration file.
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +74,10 @@ pub struct TargetSettings {
     /// How long a local write waits for another connection's lock.
     #[serde(default = "default_busy_timeout_ms")]
     pub busy_timeout_ms: u64,
+    /// `deferred` (`BEGIN`), or `concurrent` (`BEGIN CONCURRENT`, for Turso
+    /// Cloud databases on the Turso Database engine).
+    #[serde(default)]
+    pub transaction_mode: TransactionMode,
 }
 
 const fn default_operation_timeout_seconds() -> u64 {
@@ -145,6 +149,13 @@ impl Config {
                 }
                 if target.allow_client_auth_token {
                     return fail("allow_client_auth_token applies only to Turso Cloud URLs".into());
+                }
+                if target.transaction_mode == TransactionMode::Concurrent {
+                    return fail(
+                        "transaction_mode = \"concurrent\" applies only to Turso Cloud databases \
+                         on the Turso Database engine"
+                            .into(),
+                    );
                 }
             } else {
                 if target.read_only {
@@ -243,6 +254,7 @@ impl Config {
                         operation_timeout: Duration::from_secs(target.operation_timeout_seconds),
                         busy_timeout: Duration::from_millis(target.busy_timeout_ms),
                     },
+                    transactions: target.transaction_mode,
                 };
                 Ok((name.clone(), spec))
             })
@@ -288,6 +300,10 @@ mod tests {
         .unwrap();
         assert_eq!(config.targets.len(), 2);
         assert_eq!(config.targets["local"].operation_timeout_seconds, 60);
+        assert_eq!(
+            config.targets["local"].transaction_mode,
+            TransactionMode::Deferred
+        );
         let grainlift = config.grainlift();
         assert_eq!(grainlift.targets["cloud"].driver, "cloud");
         assert!(
@@ -327,6 +343,14 @@ mod tests {
             error("[targets.a]\nurl = \"same.db\"\n[targets.b]\nurl = \"file:same.db\"\nread_only = true\n")
                 .contains("same database file")
         );
+        assert!(
+            error("[targets.a]\nurl = \"app.db\"\ntransaction_mode = \"concurrent\"\n")
+                .contains("only to Turso Cloud")
+        );
+        assert!(
+            error("[targets.a]\nurl = \"libsql://x\"\nauth_token_env = \"A\"\ntransaction_mode = \"eager\"\n")
+                .contains("invalid configuration")
+        );
     }
 
     #[test]
@@ -334,6 +358,10 @@ mod tests {
         let config = Config::from_toml(include_str!("../turso.example.toml")).unwrap();
         assert_eq!(config.targets.len(), 3);
         assert!(config.targets["events"].allow_client_auth_token);
+        assert_eq!(
+            config.targets["events"].transaction_mode,
+            TransactionMode::Concurrent
+        );
         assert!(config.targets["reference"].read_only);
         assert_eq!(
             config.auth.target_permissions["analytics"],
