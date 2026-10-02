@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Query Farm LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# The published image: the release workflow's prebuilt Linux binaries
+# (dist/linux-amd64, dist/linux-arm64), so a multi-architecture image needs no
+# compilation under emulation. To build from source instead, use Dockerfile.
+
+FROM debian:bookworm-slim
+ARG TARGETARCH
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /var/lib/grainlift-turso --create-home grainlift
+COPY --chmod=0755 dist/linux-${TARGETARCH}/grainlift-turso /usr/local/bin/grainlift-turso
+USER grainlift
+WORKDIR /var/lib/grainlift-turso
+EXPOSE 8080
+ENTRYPOINT ["grainlift-turso"]
+CMD ["serve", "--config", "/etc/grainlift-turso/turso.toml"]

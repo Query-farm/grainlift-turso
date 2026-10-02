@@ -1,0 +1,172 @@
+# Copyright (c) 2026 Query Farm LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pushing a tag vX.Y.Z builds grainlift-turso for every platform, smoke-tests
+# each binary, publishes a GitHub Release with archives and checksums, and
+# pushes a multi-architecture image to ghcr.io/query-farm/grainlift-turso.
+# Running it by hand (workflow_dispatch) does everything except publish.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, archive: tar.gz, run: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, archive: tar.gz, run: true }
+          - { target: aarch64-apple-darwin, os: macos-14, archive: tar.gz, run: true }
+          - { target: x86_64-apple-darwin, os: macos-14, archive: tar.gz, run: false }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, archive: zip, run: true }
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME does not match version $version" >&2; exit 1; }
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin grainlift-turso
+      - name: Smoke test
+        if: matrix.run
+        shell: bash
+        run: |
+          binary=target/${{ matrix.target }}/release/grainlift-turso
+          "$binary" --version
+          printf '[auth.static_bearer_tokens]\n"smoke-token" = "smoke"\n\n[targets.smoke]\nurl = "smoke.db"\n' > smoke.toml
+          "$binary" check --config smoke.toml
+      - name: Package
+        shell: bash
+        run: |
+          name=grainlift-turso-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          binary=grainlift-turso
+          [ "${{ matrix.archive }}" = zip ] && binary=grainlift-turso.exe
+          cp "target/${{ matrix.target }}/release/$binary" README.md LICENSE NOTICE CHANGELOG.md turso.example.toml "dist/$name/"
+          cd dist
+          if [ "${{ matrix.archive }}" = zip ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  container:
+    name: Container image
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: '*-unknown-linux-gnu'
+          path: archives
+          merge-multiple: true
+      - name: Unpack the Linux binaries
+        shell: bash
+        run: |
+          for pair in x86_64:amd64 aarch64:arm64; do
+            target=${pair%%:*}-unknown-linux-gnu
+            mkdir -p "dist/linux-${pair##*:}"
+            tar -xzf "archives/grainlift-turso-$target.tar.gz" -C dist
+            mv "dist/grainlift-turso-$target/grainlift-turso" "dist/linux-${pair##*:}/"
+          done
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Smoke-test the amd64 image
+        shell: bash
+        run: |
+          docker buildx build --platform linux/amd64 --file Dockerfile.release --load --tag grainlift-turso:smoke .
+          printf '[auth.static_bearer_tokens]\n"smoke-token" = "smoke"\n\n[targets.smoke]\nurl = "/var/lib/grainlift-turso/smoke.db"\n' > smoke.toml
+          docker run --rm --volume "$PWD/smoke.toml:/etc/grainlift-turso/turso.toml:ro" grainlift-turso:smoke \
+            check --config /etc/grainlift-turso/turso.toml
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push both architectures
+        shell: bash
+        run: |
+          image=ghcr.io/query-farm/grainlift-turso
+          tags=(--tag "$image:edge")
+          push=()
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version=${GITHUB_REF_NAME#v}
+            tags=(--tag "$image:$version" --tag "$image:${version%.*}" --tag "$image:latest")
+            push=(--push)
+          fi
+          docker buildx build --platform linux/amd64,linux/arm64 --file Dockerfile.release \
+            --label "org.opencontainers.image.source=https://github.com/Query-farm/grainlift-turso" \
+            --label "org.opencontainers.image.description=Turso databases for every ADBC client" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            "${tags[@]}" "${push[@]}" .
+
+  release:
+    name: GitHub Release
+    needs: [build, container]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and release notes
+        shell: bash
+        run: |
+          (cd dist && sha256sum grainlift-turso-* > SHA256SUMS)
+          version=${GITHUB_REF_NAME#v}
+          awk -v version="$version" '
+            $0 ~ "^## " version "( |$)" { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for $version" >&2; exit 1; }
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "grainlift-turso $GITHUB_REF_NAME" --notes-file notes.md
