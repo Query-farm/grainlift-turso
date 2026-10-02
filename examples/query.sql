@@ -5,8 +5,10 @@
 --   uvx haybarn-cli < examples/query.sql
 --
 -- The service must be running on port 8080 (see the README). This needs
--- adbc_scanner 2d696f8 or newer, which Haybarn 1.5.5 installs.
+-- adbc_scanner 2d696f8 or newer, which Haybarn 1.5.5 installs; FORCE INSTALL
+-- replaces an older copy.
 
+FORCE INSTALL adbc_scanner FROM community;
 LOAD adbc_scanner;
 
 -- One secret holds the connection, so ATTACH and the adbc_* functions share it.

@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use adbc_core::CancelHandle;
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionValue};
 use adbc_core::schemas::{GET_INFO_SCHEMA, GET_OBJECTS_SCHEMA, GET_TABLE_TYPES_SCHEMA};
@@ -30,6 +31,8 @@ const AUTOCOMMIT: &str = "adbc.connection.autocommit";
 const CATALOG: &str = "main";
 /// Turso has no schemas; like the ADBC SQLite driver, report one unnamed one.
 const DB_SCHEMA: &str = "";
+/// Most rows one catalog query may return.
+const MAX_METADATA_ROWS: usize = 100_000;
 
 type Reader = Box<dyn RecordBatchReader + Send + 'static>;
 
@@ -45,12 +48,21 @@ impl TursoConnection {
         }
     }
 
-    /// Run a metadata query and return its rows.
+    /// Run a metadata query and return its rows, refusing a result larger
+    /// than [`MAX_METADATA_ROWS`] rather than holding it all in memory.
     fn rows(&self, sql: String) -> Result<Vec<Vec<Value>>> {
-        self.session.run(move |connection| async move {
-            let mut rows = connection.query(sql, Vec::new()).await?;
-            Ok(rows.next_rows(usize::MAX, usize::MAX).await?.0)
-        })
+        let mut rows = self.session.connection()?.query(sql, Vec::new())?;
+        let (rows, _) = rows.next_rows(MAX_METADATA_ROWS + 1, usize::MAX)?;
+        if rows.len() > MAX_METADATA_ROWS {
+            return Err(error(
+                format!(
+                    "The catalog has more than {MAX_METADATA_ROWS} entries; filter the request"
+                ),
+                Status::InvalidArguments,
+                b"54000",
+            ));
+        }
+        Ok(rows)
     }
 
     /// User tables and views, as `(name, type)`, ordered by name.
@@ -211,6 +223,11 @@ fn invalid_option(key: &str) -> Error {
 impl BackendConnection for TursoConnection {
     fn new_statement(&mut self) -> Result<Box<dyn BackendStatement>> {
         Ok(Box::new(TursoStatement::new(Arc::clone(&self.session))))
+    }
+
+    /// Cancels the running operation, such as a long query.
+    fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
+        self.session.cancel_handle()
     }
 
     /// Only autocommit can be set. Turning it off makes the next statement
@@ -399,12 +416,6 @@ impl TursoConnection {
                 Status::InvalidState,
             ))
         }
-    }
-}
-
-impl Drop for TursoConnection {
-    fn drop(&mut self) {
-        self.session.close();
     }
 }
 

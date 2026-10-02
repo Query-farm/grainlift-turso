@@ -105,7 +105,7 @@ fn turso_cloud_round_trip() {
 
 fn target() -> TargetConfig {
     TargetConfig {
-        driver: "grainlift-turso".into(),
+        driver: grainlift_turso::DEV_TARGET.into(),
         entrypoint: None,
         database_options: Vec::new(),
         connection_options: Vec::new(),
@@ -139,7 +139,7 @@ fn client_supplied_tokens() {
         return;
     }
     let backend = TursoBackend::open(&Location::parse(&url, None, false)).unwrap();
-    assert!(backend.requires_client_token());
+    assert!(backend.requires_client_token(grainlift_turso::DEV_TARGET));
     let server = common::Server::start(backend, &[("test-token", "alice")], None);
     let table = format!("grainlift_turso_client_{}", std::process::id());
     let run = |turso_token: Option<&str>, sql: &str| {

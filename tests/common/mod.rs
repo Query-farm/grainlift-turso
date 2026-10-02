@@ -64,6 +64,16 @@ pub fn connect_with(
     token: Option<&str>,
     extra: &[(&str, &str)],
 ) -> Result<ManagedConnection> {
+    connect_target(endpoint, "turso", token, extra)
+}
+
+/// [`connect_with`] for a named target.
+pub fn connect_target(
+    endpoint: &str,
+    target: &str,
+    token: Option<&str>,
+    extra: &[(&str, &str)],
+) -> Result<ManagedConnection> {
     let driver_path = driver_path().expect("GRAINLIFT_DRIVER");
     let mut driver = ManagedDriver::load_dynamic_from_filename(
         driver_path,
@@ -77,7 +87,7 @@ pub fn connect_with(
         ),
         (
             OptionDatabase::Other("grainlift.target".into()),
-            "turso".into(),
+            target.into(),
         ),
     ];
     for (key, value) in extra {

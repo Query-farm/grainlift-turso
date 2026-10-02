@@ -1,23 +1,34 @@
 // Copyright (c) 2026 Query Farm LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! One interface over Turso's two Rust clients.
+//! One synchronous interface over Turso's two Rust clients.
 //!
-//! - [`turso`]: the embedded Turso Database engine, for a local file.
-//! - [`turso_serverless`]: Turso Cloud over its SQL-over-HTTP protocol.
+//! - A local file runs in process on the Turso Database engine, through
+//!   [`turso_sdk_kit`] (the layer beneath the `turso` crate). Its synchronous
+//!   API suits Grainlift's synchronous backend traits, and it exposes what a
+//!   server needs and the `turso` crate hides: interrupting a running
+//!   statement and a busy timeout.
+//! - Turso Cloud is reached with [`turso_serverless`], which is async, so its
+//!   requests run on a [`Runtime`] owned by the backend while the calling
+//!   thread waits.
 //!
-//! Both clients are async and share an API shape, so [`Database`],
-//! [`Connection`] and [`Rows`] are thin enums over them. Grainlift's backend
-//! traits are synchronous, so every call runs on a [`Runtime`] owned by the
-//! backend and the calling thread waits for it.
+//! Every operation runs under [`Operations`]: a deadline, and cancellation by
+//! another thread.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
+use adbc_core::CancelHandle;
 use adbc_core::error::{Error, Result, Status};
 pub use turso::Value;
+use turso_sdk_kit::rsapi::{
+    TursoConnection, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatement,
+    TursoStatusCode,
+};
 
 use crate::cursor::{Cursor, Endpoint};
+use crate::ops::{Interruption, Operations, interruption_error};
 
 /// Where the database lives.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,16 +74,72 @@ impl Location {
     pub fn is_remote(&self) -> bool {
         matches!(self, Self::Remote { .. })
     }
+
+    /// A description safe to log: the host of a Turso Cloud URL, or the path
+    /// of a local file. Never the token.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Local { path, read_only } => {
+                format!(
+                    "local file {path}{}",
+                    if *read_only { " (read-only)" } else { "" }
+                )
+            }
+            Self::Remote { url, .. } => {
+                let host = url.split("://").nth(1).unwrap_or(url);
+                let host = host.split(['/', '?']).next().unwrap_or(host);
+                format!("Turso Cloud {host}")
+            }
+        }
+    }
 }
 
-/// The Tokio runtime that drives both clients.
+/// Per-operation limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Limits {
+    /// Longest one operation may run before it is stopped with ADBC `TIMEOUT`.
+    pub operation_timeout: Duration,
+    /// How long a local write waits for another connection's lock before it
+    /// fails as busy.
+    pub busy_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            operation_timeout: Duration::from_secs(60),
+            busy_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+/// The Tokio runtime that drives Turso Cloud requests and the local
+/// watchdogs.
 ///
-/// Grainlift calls backends synchronously, sometimes from inside its own Tokio
-/// runtime, where blocking on another runtime is not allowed. Each call is
-/// therefore spawned here and the caller waits with a runtime-agnostic
-/// executor.
+/// Grainlift may call a backend from inside its own Tokio runtime, where
+/// blocking on another runtime is not allowed, so work is spawned here and the
+/// caller waits with a runtime-agnostic executor.
 #[derive(Clone)]
-pub struct Runtime(Arc<tokio::runtime::Runtime>);
+pub struct Runtime(Arc<OwnedRuntime>);
+
+/// Shuts its runtime down without blocking when dropped, so the backend can
+/// be dropped anywhere, including inside another runtime (such as at the end
+/// of the production host).
+struct OwnedRuntime(Option<tokio::runtime::Runtime>);
+
+impl OwnedRuntime {
+    fn get(&self) -> &tokio::runtime::Runtime {
+        self.0.as_ref().expect("the runtime lives until dropped")
+    }
+}
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
 
 impl Runtime {
     /// Start a multi-threaded runtime.
@@ -82,7 +149,7 @@ impl Runtime {
             .enable_all()
             .build()
             .map_err(|error| io_error(format!("Could not start the Turso runtime: {error}")))?;
-        Ok(Self(Arc::new(runtime)))
+        Ok(Self(Arc::new(OwnedRuntime(Some(runtime)))))
     }
 
     /// Run `future` to completion on this runtime and return its output.
@@ -91,55 +158,103 @@ impl Runtime {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        futures::executor::block_on(self.0.spawn(future)).map_err(|_| {
+        futures::executor::block_on(self.0.get().spawn(future)).map_err(|_| {
             Error::with_message_and_status("A Turso operation failed", Status::Internal)
         })
+    }
+
+    /// Run `future` in the background, without waiting for it.
+    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.0.get().spawn(future)
     }
 }
 
 /// An open database.
 #[derive(Clone)]
 pub enum Database {
-    Local(turso::Database),
+    /// A local database, and whether it is read-only.
+    Local(Arc<TursoDatabase>, bool),
     Remote(turso_serverless::Database, Endpoint),
 }
 
 impl Database {
-    /// Open the database at `location`.
-    pub async fn open(location: &Location) -> Result<Self> {
+    /// Open the database at `location`. Opening a Turso Cloud database makes
+    /// no request.
+    pub fn open(location: &Location, runtime: &Runtime) -> Result<Self> {
         match location {
-            Location::Local { path, read_only } => turso::Builder::new_local(path)
-                .read_only(*read_only)
-                .build()
-                .await
-                .map(Self::Local)
-                .map_err(local_error),
+            Location::Local { path, read_only } => {
+                let database = TursoDatabase::new(TursoDatabaseConfig {
+                    path: path.clone(),
+                    experimental_features: None,
+                    // The engine runs its own I/O, so every call completes
+                    // synchronously on the calling thread.
+                    async_io: false,
+                    encryption: None,
+                    vfs: turso_sdk_kit::IoBackend::Default,
+                    io: None,
+                    db_file: None,
+                    page_codec: None,
+                    open_flags: if *read_only {
+                        turso_core::OpenFlags::ReadOnly
+                    } else {
+                        turso_core::OpenFlags::default()
+                    },
+                });
+                if database.open().map_err(local_error)?.is_io() {
+                    return Err(io_error("The Turso database did not finish opening".into()));
+                }
+                Ok(Self::Local(database, *read_only))
+            }
             Location::Remote { url, auth_token } => {
                 let mut builder = turso_serverless::Builder::new_remote(url.clone());
                 if let Some(token) = auth_token {
                     builder = builder.with_auth_token(token.clone());
                 }
-                let database = builder.build().await.map_err(remote_error)?;
+                let database = runtime
+                    .run(async move { builder.build().await })?
+                    .map_err(remote_error)?;
                 Ok(Self::Remote(
                     database,
-                    Endpoint::new(url, auth_token.clone()),
+                    Endpoint::new(url, auth_token.clone())?,
                 ))
             }
         }
     }
 
     /// Open a new connection, with its own transaction state.
-    pub fn connect(&self) -> Result<Connection> {
-        match self {
-            Self::Local(database) => database
-                .connect()
-                .map(Connection::Local)
-                .map_err(local_error),
-            Self::Remote(database, endpoint) => database
-                .connect()
-                .map(|connection| Connection::Remote(connection, endpoint.clone()))
-                .map_err(remote_error),
-        }
+    pub fn connect(&self, runtime: &Runtime, limits: Limits) -> Result<Connection> {
+        let (kind, operations) = match self {
+            Self::Local(database, read_only) => {
+                let connection = database.connect().map_err(local_error)?;
+                connection.set_busy_timeout(limits.busy_timeout);
+                if *read_only {
+                    // Defense in depth: Turso reuses an already-open database
+                    // for the same path without checking its read-only flag.
+                    let mut statement = connection
+                        .prepare_single("PRAGMA query_only = 1")
+                        .map_err(local_error)?;
+                    execute_local(&mut statement)?;
+                }
+                let operations =
+                    Operations::new(Some(Arc::clone(&connection)), limits.operation_timeout);
+                (Kind::Local(connection), operations)
+            }
+            Self::Remote(database, endpoint) => {
+                let connection = database.connect().map_err(remote_error)?;
+                let operations = Operations::new(None, limits.operation_timeout);
+                (Kind::Remote(connection, endpoint.clone()), operations)
+            }
+        };
+        Ok(Connection {
+            kind,
+            runtime: runtime.clone(),
+            operations,
+            open: Arc::default(),
+        })
     }
 }
 
@@ -151,69 +266,230 @@ pub struct Column {
     pub decl_type: Option<String>,
 }
 
-/// One connection. Clones share the connection and its transaction.
 #[derive(Clone)]
-pub enum Connection {
-    Local(turso::Connection),
+enum Kind {
+    Local(Arc<TursoConnection>),
     Remote(turso_serverless::Connection, Endpoint),
 }
 
+/// A local result's statement, shared with its connection so that an
+/// interrupt can close it.
+type SharedStatement = Arc<StatementSlot>;
+type StatementSlot = Mutex<Option<Box<TursoStatement>>>;
+
+/// One connection. Clones share the connection, its transaction and its
+/// operation limits.
+#[derive(Clone)]
+pub struct Connection {
+    kind: Kind,
+    runtime: Runtime,
+    operations: Arc<Operations>,
+    /// The connection's open local results.
+    open: Arc<Mutex<Vec<Weak<StatementSlot>>>>,
+}
+
 impl Connection {
-    /// Run a query and return its rows.
-    pub async fn query(&self, sql: String, params: Vec<Value>) -> Result<Rows> {
-        match self {
-            Self::Local(connection) => connection
-                .query(sql, params)
-                .await
-                .map(Rows::Local)
-                .map_err(local_error),
-            // A transaction lives on the connection's server-side stream, so
-            // its queries go through that stream and arrive whole.
-            Self::Remote(connection, _) if !connection.is_autocommit().map_err(remote_error)? => {
-                connection
-                    .query(sql, remote_params(params))
-                    .await
-                    .map(Rows::Remote)
-                    .map_err(remote_error)
+    /// Cancels this connection's running operation.
+    pub fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
+        Arc::clone(&self.operations) as Arc<dyn CancelHandle>
+    }
+
+    /// Run `work` on the local engine under a deadline: a watchdog interrupts
+    /// the running statement when it expires.
+    ///
+    /// The engine honors an interrupt only while a statement is stepping, so
+    /// the watchdog repeats it until the operation ends. Its flag stays set
+    /// while any statement on the connection is active, so after an
+    /// interrupted operation the connection's open results are closed: left
+    /// open, they would make every later statement fail as interrupted.
+    fn local<T>(
+        &self,
+        connection: &TursoConnection,
+        work: impl FnOnce(&TursoConnection) -> Result<T>,
+    ) -> Result<T> {
+        let id = self.operations.begin();
+        let operations = Arc::clone(&self.operations);
+        let timeout = operations.timeout();
+        let watchdog = self.runtime.spawn(async move {
+            tokio::time::sleep(timeout).await;
+            if operations.interrupt(Some(id), Interruption::TimedOut) {
+                tracing::warn!(
+                    timeout_seconds = timeout.as_secs_f64(),
+                    "Turso operation timed out"
+                );
             }
-            Self::Remote(_, endpoint) => Cursor::open(endpoint, sql, params)
-                .await
-                .map(|cursor| Rows::Stream(Box::new(cursor))),
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if !operations.interrupt(Some(id), Interruption::TimedOut) {
+                    break;
+                }
+            }
+        });
+        let result = work(connection);
+        watchdog.abort();
+        match (result, self.operations.end(id)) {
+            (result, Some(why)) => {
+                self.close_open_results();
+                match result {
+                    Err(_) => Err(interruption_error(why, timeout)),
+                    finished => finished,
+                }
+            }
+            (result, None) => result,
         }
     }
 
-    /// Run a statement and return the number of rows it changed.
-    /// Rows it returns, as with `RETURNING` or a `SELECT`, are discarded.
-    pub async fn execute(&self, sql: String, params: Vec<Value>) -> Result<u64> {
-        match self {
-            Self::Local(connection) => {
-                let mut statement = connection.prepare(&sql).await.map_err(local_error)?;
-                run_local(&mut statement, params).await
+    /// Track a local result's statement.
+    fn register(&self, statement: Box<TursoStatement>) -> SharedStatement {
+        let shared = Arc::new(Mutex::new(Some(statement)));
+        let mut open = self
+            .open
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        open.retain(|statement| statement.strong_count() > 0);
+        open.push(Arc::downgrade(&shared));
+        shared
+    }
+
+    /// Close every open local result, releasing its statement.
+    fn close_open_results(&self) {
+        let open = std::mem::take(
+            &mut *self
+                .open
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
+        for statement in open.iter().filter_map(Weak::upgrade) {
+            statement
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take();
+        }
+    }
+
+    /// Run a Turso Cloud request under a deadline and cancellation.
+    fn remote<T, F>(&self, request: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let id = self.operations.begin();
+        let operations = Arc::clone(&self.operations);
+        let timeout = operations.timeout();
+        let result = self.runtime.run(async move {
+            tokio::select! {
+                result = request => result,
+                () = tokio::time::sleep(timeout) => {
+                    operations.interrupt(Some(id), Interruption::TimedOut);
+                    tracing::warn!(timeout_seconds = timeout.as_secs_f64(), "Turso Cloud request timed out");
+                    Err(interruption_error(Interruption::TimedOut, timeout))
+                }
+                why = operations.interrupted(id) => Err(interruption_error(why, timeout)),
             }
-            Self::Remote(connection, _) => connection
-                .execute(sql, remote_params(params))
-                .await
-                .map_err(remote_error),
+        });
+        self.operations.end(id);
+        result?
+    }
+
+    /// Run a query and return its rows, which are read on demand.
+    pub fn query(&self, sql: String, params: Vec<Value>) -> Result<Rows> {
+        let inner = match &self.kind {
+            Kind::Local(connection) => self.local(connection, |connection| {
+                let mut statement = connection.prepare_single(&sql).map_err(local_error)?;
+                bind(&mut statement, params)?;
+                Ok(RowsInner::Local(self.register(statement)))
+            })?,
+            // A transaction lives on the connection's server-side stream, so
+            // its queries go through that stream, and arrive whole.
+            Kind::Remote(connection, _) if !connection.is_autocommit().map_err(remote_error)? => {
+                let connection = connection.clone();
+                let rows = self.remote(async move {
+                    connection
+                        .query(sql, remote_params(params))
+                        .await
+                        .map_err(remote_error)
+                })?;
+                RowsInner::Buffered(rows)
+            }
+            Kind::Remote(_, endpoint) => {
+                let endpoint = endpoint.clone();
+                let cursor =
+                    self.remote(async move { Cursor::open(&endpoint, sql, params).await })?;
+                RowsInner::Stream(Box::new(cursor))
+            }
+        };
+        let columns = match &inner {
+            RowsInner::Local(statement) => {
+                let statement = statement
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                match statement.as_ref() {
+                    Some(statement) => local_columns(statement)?,
+                    None => return Err(closed_result_error()),
+                }
+            }
+            RowsInner::Buffered(rows) => rows
+                .columns()
+                .into_iter()
+                .map(|column| Column {
+                    name: column.name,
+                    decl_type: column.decl_type,
+                })
+                .collect(),
+            RowsInner::Stream(cursor) => cursor.columns(),
+            RowsInner::Finished => Vec::new(),
+        };
+        Ok(Rows {
+            connection: self.clone(),
+            inner,
+            columns,
+        })
+    }
+
+    /// Run a statement and return the number of rows it changed. Rows it
+    /// returns, as with `RETURNING` or a `SELECT`, are discarded.
+    pub fn execute(&self, sql: &str, params: Vec<Value>) -> Result<u64> {
+        match &self.kind {
+            Kind::Local(connection) => self.local(connection, |connection| {
+                let mut statement = connection.prepare_single(sql).map_err(local_error)?;
+                bind(&mut statement, params)?;
+                execute_local(&mut statement)
+            }),
+            Kind::Remote(connection, _) => {
+                let connection = connection.clone();
+                let sql = sql.to_string();
+                self.remote(async move {
+                    connection
+                        .execute(sql, remote_params(params))
+                        .await
+                        .map_err(remote_error)
+                })
+            }
         }
     }
 
     /// Run one statement once per row of parameters, in order, and return the
     /// total number of rows changed. Stops at the first failure; the caller
     /// owns the transaction around it.
-    pub async fn execute_each(&self, sql: String, rows: Vec<Vec<Value>>) -> Result<u64> {
-        match self {
-            Self::Local(connection) => {
-                let mut statement = connection.prepare(&sql).await.map_err(local_error)?;
+    pub fn execute_each(&self, sql: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
+        match &self.kind {
+            Kind::Local(connection) => self.local(connection, |connection| {
+                let mut statement = connection.prepare_single(sql).map_err(local_error)?;
                 let mut changed = 0;
                 for params in rows {
-                    changed += run_local(&mut statement, params).await?;
                     statement.reset().map_err(local_error)?;
+                    bind(&mut statement, params)?;
+                    changed += execute_local(&mut statement)?;
                 }
                 Ok(changed)
-            }
-            Self::Remote(connection, _) => {
-                let statements = rows.into_iter().map(|params| (sql.clone(), params));
-                remote_batches(connection, statements).await
+            }),
+            Kind::Remote(connection, _) => {
+                let connection = connection.clone();
+                let sql = sql.to_string();
+                self.remote(async move {
+                    let statements = rows.into_iter().map(|params| (sql.clone(), params));
+                    remote_batches(&connection, statements).await
+                })
             }
         }
     }
@@ -225,16 +501,11 @@ impl Connection {
     /// Locally each row runs through one prepared statement. Turso Cloud
     /// receives multi-row `INSERT`s, many per request, so a large ingestion
     /// takes few round trips.
-    pub async fn insert_rows(
-        &self,
-        insert: &str,
-        width: usize,
-        rows: Vec<Vec<Value>>,
-    ) -> Result<u64> {
+    pub fn insert_rows(&self, insert: &str, width: usize, rows: Vec<Vec<Value>>) -> Result<u64> {
         let tuple = format!("({})", vec!["?"; width].join(", "));
-        match self {
-            Self::Local(_) => self.execute_each(format!("{insert} {tuple}"), rows).await,
-            Self::Remote(connection, _) => {
+        match &self.kind {
+            Kind::Local(_) => self.execute_each(&format!("{insert} {tuple}"), rows),
+            Kind::Remote(connection, _) => {
                 let per_statement = (MAX_PARAMETERS / width.max(1)).clamp(1, MAX_ROWS_PER_INSERT);
                 let mut statements = Vec::new();
                 let mut rows = rows.into_iter().peekable();
@@ -249,125 +520,251 @@ impl Connection {
                     let sql = format!("{insert} {}", vec![tuple.as_str(); chunk.len()].join(", "));
                     statements.push((sql, chunk.into_iter().flatten().collect()));
                 }
-                remote_batches(connection, statements).await
+                let connection = connection.clone();
+                self.remote(async move { remote_batches(&connection, statements).await })
             }
         }
     }
 
     /// Prepare `sql` without running it, and describe its result columns.
-    pub async fn describe(&self, sql: String) -> Result<Vec<Column>> {
-        match self {
-            Self::Local(connection) => {
-                let statement = connection.prepare(&sql).await.map_err(local_error)?;
-                Ok(statement
-                    .columns()
-                    .iter()
-                    .map(|column| Column {
-                        name: column.name().to_string(),
-                        decl_type: column.decl_type().map(str::to_string),
-                    })
-                    .collect())
+    pub fn describe(&self, sql: &str) -> Result<Vec<Column>> {
+        match &self.kind {
+            Kind::Local(connection) => self.local(connection, |connection| {
+                let statement = connection.prepare_single(sql).map_err(local_error)?;
+                local_columns(&statement)
+            }),
+            Kind::Remote(connection, _) => {
+                let connection = connection.clone();
+                let sql = sql.to_string();
+                self.remote(async move {
+                    let statement = connection.prepare(&sql).await.map_err(remote_error)?;
+                    Ok(statement
+                        .columns()
+                        .into_iter()
+                        .map(|column| Column {
+                            name: column.name,
+                            decl_type: column.decl_type,
+                        })
+                        .collect())
+                })
             }
-            Self::Remote(connection, _) => {
-                let statement = connection.prepare(&sql).await.map_err(remote_error)?;
-                Ok(statement
-                    .columns()
-                    .into_iter()
-                    .map(|column| Column {
-                        name: column.name,
-                        decl_type: column.decl_type,
-                    })
-                    .collect())
-            }
-        }
-    }
-
-    /// Close the connection. A Turso Cloud stream is released, rolling back
-    /// any open transaction; a local connection closes when dropped.
-    pub async fn close(&self) {
-        if let Self::Remote(connection, _) = self {
-            // Closing cannot fail in a way the caller could act on.
-            let _ = connection.close().await;
         }
     }
 
     /// Whether no transaction is open.
     pub fn is_autocommit(&self) -> Result<bool> {
-        match self {
-            Self::Local(connection) => connection.is_autocommit().map_err(local_error),
-            Self::Remote(connection, _) => connection.is_autocommit().map_err(remote_error),
+        match &self.kind {
+            Kind::Local(connection) => Ok(connection.get_auto_commit()),
+            Kind::Remote(connection, _) => connection.is_autocommit().map_err(remote_error),
+        }
+    }
+
+    /// Run `work` atomically: inside the connection's open transaction, or
+    /// else in a transaction of its own.
+    pub fn atomically<T>(&self, work: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if !self.is_autocommit()? {
+            return work(self);
+        }
+        self.execute("BEGIN", Vec::new())?;
+        match work(self) {
+            Ok(value) => {
+                self.execute("COMMIT", Vec::new())?;
+                Ok(value)
+            }
+            Err(failure) => {
+                // The original failure matters more than a failed rollback.
+                if !self.is_autocommit().unwrap_or(true) {
+                    let _ = self.execute("ROLLBACK", Vec::new());
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    /// Release the connection. A Turso Cloud stream is closed in the
+    /// background, rolling back any open transaction; nothing waits for it.
+    /// A local connection closes when its last handle is dropped.
+    pub fn close(&self) {
+        if let Kind::Remote(connection, _) = &self.kind {
+            let connection = connection.clone();
+            self.runtime.spawn(async move {
+                // Turso Cloud also expires idle streams, so a failure is harmless.
+                let _ = tokio::time::timeout(Duration::from_secs(10), connection.close()).await;
+            });
         }
     }
 }
 
-/// The rows of a running query.
-///
-/// The embedded engine steps its cursor one row at a time; Turso Cloud sends
-/// the whole result in one response.
-pub enum Rows {
-    Local(turso::Rows),
-    Remote(turso_serverless::Rows),
+enum RowsInner {
+    Local(SharedStatement),
+    Buffered(turso_serverless::Rows),
     Stream(Box<Cursor>),
+    Finished,
+}
+
+/// The rows of a running query, read on demand: the embedded engine steps its
+/// cursor, Turso Cloud streams its cursor endpoint, and inside a Turso Cloud
+/// transaction the result arrives whole.
+pub struct Rows {
+    connection: Connection,
+    inner: RowsInner,
+    columns: Vec<Column>,
 }
 
 impl Rows {
     /// The result columns.
-    pub fn columns(&self) -> Vec<Column> {
-        match self {
-            Self::Local(rows) => rows
-                .columns()
-                .iter()
-                .map(|column| Column {
-                    name: column.name().to_string(),
-                    decl_type: column.decl_type().map(str::to_string),
-                })
-                .collect(),
-            Self::Stream(cursor) => cursor.columns(),
-            Self::Remote(rows) => rows
-                .columns()
-                .into_iter()
-                .map(|column| Column {
-                    name: column.name,
-                    decl_type: column.decl_type,
-                })
-                .collect(),
-        }
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
     }
 
     /// Read the next rows, up to `max_rows` rows or until they reach about
     /// `max_bytes` (always at least one row). The flag is true once the result
-    /// is exhausted.
-    pub async fn next_rows(
+    /// is exhausted, and the cursor is then released.
+    pub fn next_rows(
         &mut self,
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<(Vec<Vec<Value>>, bool)> {
-        if let Self::Stream(cursor) = self {
-            return cursor.next_rows(max_rows, max_bytes).await;
+        match std::mem::replace(&mut self.inner, RowsInner::Finished) {
+            RowsInner::Finished => Ok((Vec::new(), true)),
+            RowsInner::Local(statement) => {
+                let Kind::Local(connection) = &self.connection.kind else {
+                    unreachable!("local rows belong to a local connection")
+                };
+                let read = self.connection.local(connection, |_| {
+                    let mut guard = statement
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    match guard.as_mut() {
+                        Some(statement) => read_local(statement, max_rows, max_bytes),
+                        None => Err(closed_result_error()),
+                    }
+                });
+                if let Ok((_, false)) = read {
+                    self.inner = RowsInner::Local(statement);
+                } else {
+                    // Finished or failed: release the statement now.
+                    statement
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .take();
+                }
+                read
+            }
+            RowsInner::Buffered(mut rows) => {
+                let read =
+                    futures::executor::block_on(read_buffered(&mut rows, max_rows, max_bytes));
+                if let Ok((_, false)) = read {
+                    self.inner = RowsInner::Buffered(rows);
+                }
+                read
+            }
+            RowsInner::Stream(mut cursor) => {
+                let read = self.connection.remote(async move {
+                    let read = cursor.next_rows(max_rows, max_bytes).await;
+                    read.map(|(rows, done)| (rows, done, cursor))
+                });
+                match read {
+                    Ok((rows, done, cursor)) => {
+                        if !done {
+                            self.inner = RowsInner::Stream(cursor);
+                        }
+                        Ok((rows, done))
+                    }
+                    Err(failure) => Err(failure),
+                }
+            }
         }
-        let mut rows = Vec::new();
-        let mut bytes = 0;
-        while rows.len() < max_rows && bytes < max_bytes {
-            let row = match self {
-                Self::Local(cursor) => match cursor.next().await.map_err(local_error)? {
-                    Some(row) => (0..row.column_count())
-                        .map(|index| row.get_value(index).map_err(local_error))
-                        .collect::<Result<Vec<_>>>()?,
-                    None => return Ok((rows, true)),
-                },
-                Self::Remote(cursor) => match cursor.next().await.map_err(remote_error)? {
-                    Some(row) => (0..row.column_count())
-                        .map(|index| row.get_value(index).map(from_remote).map_err(remote_error))
-                        .collect::<Result<Vec<_>>>()?,
-                    None => return Ok((rows, true)),
-                },
-                Self::Stream(_) => unreachable!("streamed above"),
-            };
-            bytes += crate::types::row_bytes(&row);
-            rows.push(row);
-        }
-        Ok((rows, false))
     }
+}
+
+/// The error a result closed by an interrupt reports.
+fn closed_result_error() -> Error {
+    error(
+        "This result was closed because an operation on its connection was interrupted",
+        Status::Cancelled,
+        b"HY008",
+    )
+}
+
+fn bind(statement: &mut TursoStatement, params: Vec<Value>) -> Result<()> {
+    for (index, value) in params.into_iter().enumerate() {
+        statement
+            .bind_positional(index + 1, value.into())
+            .map_err(local_error)?;
+    }
+    Ok(())
+}
+
+fn local_columns(statement: &TursoStatement) -> Result<Vec<Column>> {
+    (0..statement.column_count())
+        .map(|index| {
+            Ok(Column {
+                name: statement.column_name(index).map_err(local_error)?,
+                decl_type: statement.column_decltype(index),
+            })
+        })
+        .collect()
+}
+
+/// Step a local statement to completion, discarding any rows, and return the
+/// number of rows it changed.
+fn execute_local(statement: &mut TursoStatement) -> Result<u64> {
+    loop {
+        match statement.step(None).map_err(local_error)? {
+            TursoStatusCode::Row => {}
+            TursoStatusCode::Done => return Ok(statement.n_change().max(0) as u64),
+            TursoStatusCode::Io => statement.run_io().map_err(local_error)?,
+        }
+    }
+}
+
+fn read_local(
+    statement: &mut TursoStatement,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<(Vec<Vec<Value>>, bool)> {
+    let mut rows = Vec::new();
+    let mut bytes = 0;
+    while rows.len() < max_rows && bytes < max_bytes {
+        match statement.step(None).map_err(local_error)? {
+            TursoStatusCode::Row => {
+                let row = (0..statement.column_count())
+                    .map(|index| {
+                        statement
+                            .row_value(index)
+                            .map(Value::from)
+                            .map_err(local_error)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                bytes += crate::types::row_bytes(&row);
+                rows.push(row);
+            }
+            TursoStatusCode::Done => return Ok((rows, true)),
+            TursoStatusCode::Io => statement.run_io().map_err(local_error)?,
+        }
+    }
+    Ok((rows, false))
+}
+
+async fn read_buffered(
+    rows: &mut turso_serverless::Rows,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<(Vec<Vec<Value>>, bool)> {
+    let mut read = Vec::new();
+    let mut bytes = 0;
+    while read.len() < max_rows && bytes < max_bytes {
+        let Some(row) = rows.next().await.map_err(remote_error)? else {
+            return Ok((read, true));
+        };
+        let row = (0..row.column_count())
+            .map(|index| row.get_value(index).map(from_remote).map_err(remote_error))
+            .collect::<Result<Vec<_>>>()?;
+        bytes += crate::types::row_bytes(&row);
+        read.push(row);
+    }
+    Ok((read, false))
 }
 
 /// Most bound parameters in one statement (SQLite's default limit, which
@@ -418,16 +815,6 @@ async fn remote_batches(
     Ok(changed)
 }
 
-/// Step a local statement to completion, discarding any rows (the engine's
-/// own `execute` refuses statements that return rows), and return the number
-/// of rows it changed.
-async fn run_local(statement: &mut turso::Statement, params: Vec<Value>) -> Result<u64> {
-    let mut rows = statement.query(params).await.map_err(local_error)?;
-    while rows.next().await.map_err(local_error)?.is_some() {}
-    drop(rows);
-    Ok(statement.n_change())
-}
-
 fn remote_params(params: Vec<Value>) -> Vec<turso_serverless::Value> {
     params.into_iter().map(to_remote).collect()
 }
@@ -459,7 +846,7 @@ pub fn error(message: impl Into<String>, status: Status, sqlstate: &[u8; 5]) -> 
     error
 }
 
-fn io_error(message: String) -> Error {
+pub(crate) fn io_error(message: String) -> Error {
     error(message, Status::IO, b"58000")
 }
 
@@ -481,34 +868,49 @@ fn classify(kind: &str) -> (Status, &'static [u8; 5]) {
 
 /// Convert an embedded-engine error. Messages are the engine's own, such as
 /// `no such table: t`; they never contain credentials.
-pub fn local_error(failure: turso::Error) -> Error {
-    let (status, sqlstate) = classify(local_kind(&failure));
-    error(failure.to_string(), status, sqlstate)
+pub fn local_error(failure: TursoError) -> Error {
+    let kind = match &failure {
+        TursoError::Error(message) if message.contains("query_only mode") => "readonly",
+        TursoError::Constraint(_) => "constraint",
+        TursoError::Busy(_) | TursoError::BusySnapshot(_) => "busy",
+        TursoError::Interrupt(_) => "interrupt",
+        TursoError::Misuse(_) => "misuse",
+        TursoError::Readonly(_) => "readonly",
+        TursoError::DatabaseFull(_) => "full",
+        TursoError::NotAdb(_) | TursoError::Corrupt(_) => "corrupt",
+        TursoError::IoError(..) => "io",
+        TursoError::Error(_) => "error",
+    };
+    let (status, sqlstate) = classify(kind);
+    error(local_message(&failure), status, sqlstate)
 }
 
-fn local_kind(failure: &turso::Error) -> &'static str {
-    use turso::Error as E;
+fn local_message(failure: &TursoError) -> String {
     match failure {
-        E::BatchStatementFailed { error, .. } => local_kind(error),
-        E::Constraint(_) => "constraint",
-        E::Busy(_) | E::BusySnapshot(_) => "busy",
-        E::Interrupt(_) => "interrupt",
-        E::Misuse(_) => "misuse",
-        E::Readonly(_) => "readonly",
-        E::DatabaseFull(_) => "full",
-        E::NotAdb(_) | E::Corrupt(_) => "corrupt",
-        E::IoError(..) => "io",
-        E::ToSqlConversionFailure(_) | E::ConversionFailure(_) => "conversion",
-        _ => "error",
+        TursoError::Busy(message)
+        | TursoError::BusySnapshot(message)
+        | TursoError::Interrupt(message)
+        | TursoError::Error(message)
+        | TursoError::Misuse(message)
+        | TursoError::Constraint(message)
+        | TursoError::Readonly(message)
+        | TursoError::DatabaseFull(message)
+        | TursoError::NotAdb(message)
+        | TursoError::Corrupt(message) => message.clone(),
+        TursoError::IoError(kind, operation) => format!("I/O error ({operation}): {kind}"),
     }
 }
 
 /// Convert a Turso Cloud error. HTTP failures describe the request, never the
 /// auth token, which travels in a header.
+///
+/// Two cases are recognized by their text, because `turso_serverless` reports
+/// them only as text: an HTTP status (its `HTTP status NNN` wording, which
+/// [`crate::cursor`] reproduces), and a read-only token's refused write.
+/// `tests/backend.rs` pins both wordings for the locked client version.
 pub fn remote_error(failure: turso_serverless::Error) -> Error {
     if let turso_serverless::Error::Http(message) = &failure {
         let message = format!("Turso Cloud request failed: {message}");
-        // The client reports the HTTP status and Turso's reason in the text.
         return if message.contains("HTTP status 401") || message.contains("JWT error") {
             error(message, Status::Unauthenticated, b"28000")
         } else if message.contains("HTTP status 403") {
@@ -518,7 +920,6 @@ pub fn remote_error(failure: turso_serverless::Error) -> Error {
         };
     }
     let mut kind = remote_kind(&failure);
-    // A read-only token's writes fail with a generic error code.
     if kind == "error"
         && failure
             .to_string()
@@ -549,7 +950,7 @@ fn remote_kind(failure: &turso_serverless::Error) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::Location;
+    use super::*;
 
     #[test]
     fn parses_locations() {
@@ -569,5 +970,54 @@ mod tests {
             }
         );
         assert!(!Location::parse(":memory:", None, false).is_remote());
+    }
+
+    #[test]
+    fn descriptions_never_include_tokens() {
+        let remote = Location::parse(
+            "libsql://db-org.turso.io/path?x=1",
+            Some("secret".into()),
+            false,
+        );
+        assert_eq!(remote.describe(), "Turso Cloud db-org.turso.io");
+        assert_eq!(
+            Location::parse("app.db", None, true).describe(),
+            "local file app.db (read-only)"
+        );
+    }
+
+    #[test]
+    fn classifies_turso_cloud_errors_by_their_wording() {
+        use turso_serverless::Error as E;
+        let status = |failure| remote_error(failure).status;
+        assert_eq!(
+            status(E::Http("HTTP status 401 Unauthorized".into())),
+            Status::Unauthenticated
+        );
+        assert_eq!(
+            status(E::Http(
+                "HTTP status 400 Bad Request: JWT error: InvalidToken".into()
+            )),
+            Status::Unauthenticated
+        );
+        assert_eq!(
+            status(E::Http("HTTP status 403 Forbidden".into())),
+            Status::Unauthorized
+        );
+        assert_eq!(
+            status(E::Http("request failed: connection refused".into())),
+            Status::IO
+        );
+        assert_eq!(
+            status(E::Error(
+                "Operation was blocked: SQL write operations are forbidden (current session doesn't have write permission)"
+                    .into()
+            )),
+            Status::Unauthorized
+        );
+        assert_eq!(
+            status(E::Constraint("UNIQUE constraint failed".into())),
+            Status::Integrity
+        );
     }
 }

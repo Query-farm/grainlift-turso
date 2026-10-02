@@ -1,0 +1,68 @@
+# grainlift-turso production configuration.
+#
+#   grainlift-turso check --config turso.toml    # validate, read secrets, connect
+#   grainlift-turso serve --config turso.toml
+#
+# [server], [auth] and [tcp] are Grainlift's own sections, with the same fields,
+# defaults and validation as the grainlift-server binary. Each [targets.NAME]
+# table is one Turso database, which clients select as their Grainlift target.
+
+[server]
+# A plaintext HTTP listener. Outside loopback, terminate TLS in front of it
+# (a load balancer or sidecar) and set allow_insecure_remote = true.
+listen = "127.0.0.1:8080"
+# Idle sessions (and their open transactions) are closed after this long.
+session_ttl_seconds = 3600
+request_timeout_seconds = 300
+# Grainlift's own deadline for one backend call. Each target's
+# operation_timeout_seconds must be shorter, so a slow Turso operation is
+# stopped and reported as ADBC TIMEOUT before Grainlift gives up on it.
+driver_operation_timeout_seconds = 270
+shutdown_grace_seconds = 30
+max_sessions = 1024
+max_sessions_per_principal = 32
+
+[auth]
+# Static bearer tokens, mapped to principals. Inject this file from a secret
+# store rather than committing it. Alternatively configure [auth.jwt] (and
+# [auth.oauth] for browser and CLI sign-in) exactly as for grainlift-server.
+[auth.static_bearer_tokens]
+"replace-with-a-long-random-token" = "analytics"
+"replace-with-another-long-random-token" = "etl"
+
+# Which principals may use which targets. Without this table every principal
+# may use every target; once present, unlisted principals are denied.
+[auth.target_permissions]
+analytics = ["app", "events"]
+etl = ["*"]
+
+# Optional raw TCP listener with mutual TLS; clients are identified by the
+# SPIFFE URI in their certificate.
+# [tcp]
+# listen = "0.0.0.0:8443"
+# [tcp.tls]
+# server_certificate_chain = "/etc/grainlift-turso/server.pem"
+# server_private_key = "/etc/grainlift-turso/server-key.pem"
+# client_ca = "/etc/grainlift-turso/clients-ca.pem"
+# trust_domains = ["example.org"]
+
+# A Turso Cloud database. The token is read from the environment, never from
+# this file; auth_token_file reads it from a file such as a mounted secret.
+[targets.app]
+url = "libsql://app-myorg.turso.io"
+auth_token_env = "TURSO_APP_TOKEN"
+# Longest one Turso operation (an execute, or one batch of a result) may run.
+operation_timeout_seconds = 60
+
+# A Turso Cloud database whose clients each send their own Turso token in the
+# turso.auth_token database option, so Turso applies each token's permissions.
+[targets.events]
+url = "libsql://events-myorg.turso.io"
+allow_client_auth_token = true
+
+# A local database file on the embedded Turso Database engine.
+[targets.reference]
+url = "/var/lib/grainlift-turso/reference.db"
+read_only = true
+# How long a write waits for another connection's lock before failing as busy.
+busy_timeout_ms = 5000

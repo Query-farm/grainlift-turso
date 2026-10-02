@@ -5,13 +5,14 @@
 
 use std::sync::Arc;
 
+use adbc_core::CancelHandle;
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::OptionValue;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use grainlift_server::backend::{BackendStatement, QueryResult};
 
-use crate::db::{self, Rows, Value, error};
+use crate::db::{Rows, Value, error};
 use crate::session::Session;
 use crate::types;
 
@@ -37,10 +38,45 @@ struct Ingest {
     temporary: bool,
 }
 
-/// Parameters bound with `bind` or `bind_stream`.
-struct Bound {
-    schema: SchemaRef,
-    rows: Vec<Vec<Value>>,
+/// Parameters bound with `bind` or `bind_stream`, kept as Arrow.
+///
+/// They are converted to Turso values one batch at a time as the statement
+/// runs, so the memory a large binding takes is its Arrow size plus one
+/// batch, not every row converted at once.
+enum Bound {
+    /// One batch, which can run any number of times.
+    Batch(RecordBatch),
+    /// A stream, which can be read once.
+    Stream(Box<dyn RecordBatchReader + Send>),
+    /// A stream that has been read.
+    Spent(SchemaRef),
+}
+
+type Batches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
+
+impl Bound {
+    fn schema(&self) -> SchemaRef {
+        match self {
+            Self::Batch(batch) => batch.schema(),
+            Self::Stream(reader) => reader.schema(),
+            Self::Spent(schema) => schema.clone(),
+        }
+    }
+
+    /// The bound batches, in order. A stream is spent afterwards.
+    fn batches(&mut self) -> Result<Batches> {
+        match std::mem::replace(self, Self::Spent(self.schema())) {
+            Self::Batch(batch) => {
+                *self = Self::Batch(batch.clone());
+                Ok(Box::new(std::iter::once(Ok(batch))))
+            }
+            Self::Stream(reader) => Ok(Box::new(reader.map(|batch| batch.map_err(Error::from)))),
+            Self::Spent(_) => Err(Error::with_message_and_status(
+                "The bound parameter stream was already used; bind the parameters again",
+                Status::InvalidState,
+            )),
+        }
+    }
 }
 
 /// One ADBC statement on a [`Session`].
@@ -71,15 +107,24 @@ impl TursoStatement {
     }
 
     /// The single row of parameters a query runs with.
-    fn query_parameters(&self) -> Result<Vec<Value>> {
-        match self.bound.as_ref().map(|bound| bound.rows.as_slice()) {
-            None => Ok(Vec::new()),
-            Some([row]) => Ok(row.clone()),
-            Some(rows) => Err(Error::with_message_and_status(
+    fn query_parameters(&mut self) -> Result<Vec<Value>> {
+        let Some(bound) = self.bound.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut rows = Vec::new();
+        for batch in bound.batches()? {
+            rows.extend(types::batch_rows(&batch?)?);
+            if rows.len() > 1 {
+                break;
+            }
+        }
+        match <[Vec<Value>; 1]>::try_from(rows) {
+            Ok([row]) => Ok(row),
+            Err(rows) => Err(Error::with_message_and_status(
                 format!(
-                    "A query runs with one row of parameters, but {} rows are bound; use \
+                    "A query runs with one row of parameters, but {} are bound; use \
                      execute_update to run a statement once per row",
-                    rows.len()
+                    if rows.is_empty() { "none" } else { "several" }
                 ),
                 Status::InvalidArguments,
             )),
@@ -97,16 +142,10 @@ impl TursoStatement {
         }
         let sql = self.sql()?;
         let params = self.query_parameters()?;
-        let (rows, columns, first) = self.session.run(move |connection| async move {
-            let mut rows = connection.query(sql, params).await?;
-            let columns = rows.columns();
-            let first = rows.next_rows(BATCH_ROWS, BATCH_BYTES).await?;
-            Ok((rows, columns, first))
-        })?;
-        let (first, done) = first;
-        let schema = types::result_schema(&columns, &first);
-        let rows = (!done).then_some(rows);
-        TursoReader::new(self.session.runtime().clone(), rows, schema, first)
+        let mut rows = self.session.connection()?.query(sql, params)?;
+        let (first, done) = rows.next_rows(BATCH_ROWS, BATCH_BYTES)?;
+        let schema = types::result_schema(rows.columns(), &first);
+        TursoReader::new((!done).then_some(rows), schema, first)
     }
 
     fn ingest(&mut self) -> Result<i64> {
@@ -128,15 +167,15 @@ impl TursoStatement {
         {
             return Err(not_found(format!("Turso has no schema {schema:?}")));
         }
-        let bound = self.bound.take().ok_or_else(|| {
+        let mut bound = self.bound.take().ok_or_else(|| {
             Error::with_message_and_status(
                 "Bind the data to ingest before executing the statement",
                 Status::InvalidState,
             )
         })?;
+        let schema = bound.schema();
         let name = quote(&table);
-        let declarations = bound
-            .schema
+        let declarations = schema
             .fields()
             .iter()
             .map(|field| {
@@ -168,50 +207,30 @@ impl TursoStatement {
         };
         let insert = format!(
             "INSERT INTO {name} ({}) VALUES",
-            bound
-                .schema
+            schema
                 .fields()
                 .iter()
                 .map(|field| quote(field.name()))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        let width = bound.schema.fields().len();
-        let count = bound.rows.len();
-        self.session.run(move |connection| async move {
-            db_atomically(&connection, async {
-                for sql in setup {
-                    connection.execute(sql, Vec::new()).await?;
-                }
-                connection.insert_rows(&insert, width, bound.rows).await
-            })
-            .await
+        let width = schema.fields().len();
+        let batches = bound.batches()?;
+        let ingested = self.session.connection()?.atomically(|connection| {
+            for sql in &setup {
+                connection.execute(sql, Vec::new())?;
+            }
+            let mut ingested = 0;
+            for batch in batches {
+                let rows = types::batch_rows(&batch?)?;
+                ingested += rows.len();
+                connection.insert_rows(&insert, width, rows)?;
+            }
+            Ok(ingested)
         })?;
+        tracing::debug!(rows = ingested, "ingested");
         // Change counts can include trigger effects; report the rows ingested.
-        Ok(count as i64)
-    }
-}
-
-/// Run `work` atomically: inside the connection's open transaction, or else
-/// in a transaction of its own.
-async fn db_atomically<T>(
-    connection: &db::Connection,
-    work: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    if !connection.is_autocommit()? {
-        return work.await;
-    }
-    connection.execute("BEGIN".into(), Vec::new()).await?;
-    match work.await {
-        Ok(value) => {
-            connection.execute("COMMIT".into(), Vec::new()).await?;
-            Ok(value)
-        }
-        Err(failure) => {
-            // The original failure matters more than a failed rollback.
-            let _ = connection.execute("ROLLBACK".into(), Vec::new()).await;
-            Err(failure)
-        }
+        Ok(ingested as i64)
     }
 }
 
@@ -269,10 +288,7 @@ impl BackendStatement for TursoStatement {
         if self.ingest.table.is_some() {
             return Ok(());
         }
-        let sql = self.sql()?;
-        self.session
-            .run(move |connection| async move { connection.describe(sql).await })
-            .map(drop)
+        self.session.connection()?.describe(&self.sql()?).map(drop)
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
@@ -280,20 +296,14 @@ impl BackendStatement for TursoStatement {
     }
 
     fn bind(&mut self, batch: RecordBatch) -> Result<()> {
-        self.bound = Some(Bound {
-            schema: batch.schema(),
-            rows: types::batch_rows(&batch)?,
-        });
+        self.bound = Some(Bound::Batch(batch));
         Ok(())
     }
 
+    /// Keep the stream and read it while executing: Grainlift lends it until
+    /// the statement is replaced or closed.
     fn bind_stream(&mut self, reader: Box<dyn RecordBatchReader + Send>) -> Result<()> {
-        let schema = reader.schema();
-        let mut rows = Vec::new();
-        for batch in reader {
-            rows.extend(types::batch_rows(&batch?)?);
-        }
-        self.bound = Some(Bound { schema, rows });
+        self.bound = Some(Bound::Stream(reader));
         Ok(())
     }
 
@@ -302,10 +312,7 @@ impl BackendStatement for TursoStatement {
     /// first batch, and any other statement must be executed instead.
     fn execute_schema(&mut self) -> Result<Schema> {
         let sql = self.sql()?;
-        let described = sql.clone();
-        let columns = self
-            .session
-            .run(move |connection| async move { connection.describe(described).await })?;
+        let columns = self.session.connection()?.describe(&sql)?;
         if let Some(schema) = types::declared_schema(&columns) {
             return Ok(schema);
         }
@@ -330,17 +337,30 @@ impl BackendStatement for TursoStatement {
             return self.ingest().map(Some);
         }
         let sql = self.sql()?;
-        let rows = match &self.bound {
-            None => vec![Vec::new()],
-            Some(bound) => bound.rows.clone(),
-        };
-        let changed = self.session.run(move |connection| async move {
-            if let [params] = rows.as_slice() {
-                return connection.execute(sql, params.clone()).await;
+        let connection = self.session.connection()?;
+        let changed = match self.bound.as_mut() {
+            None => connection.execute(&sql, Vec::new())?,
+            // One row is atomic on its own; no transaction round trips.
+            Some(Bound::Batch(batch)) if batch.num_rows() == 1 => {
+                let mut rows = types::batch_rows(batch)?;
+                connection.execute(&sql, rows.pop().unwrap_or_default())?
             }
-            db_atomically(&connection, connection.execute_each(sql, rows)).await
-        })?;
+            Some(bound) => {
+                let batches = bound.batches()?;
+                connection.atomically(|connection| {
+                    let mut changed = 0;
+                    for batch in batches {
+                        changed += connection.execute_each(&sql, types::batch_rows(&batch?)?)?;
+                    }
+                    Ok(changed)
+                })?
+            }
+        };
         Ok(Some(changed as i64))
+    }
+
+    fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
+        self.session.cancel_handle()
     }
 }
 
@@ -371,9 +391,9 @@ fn not_found(message: String) -> Error {
     error(message, Status::NotFound, b"3F000")
 }
 
-/// A query's result, read lazily in bounded batches from Turso's cursor.
+/// A query's result, read lazily in bounded batches from Turso's cursor. Each
+/// fetch is one operation, with its own deadline.
 pub struct TursoReader {
-    runtime: db::Runtime,
     rows: Option<Rows>,
     schema: SchemaRef,
     first: Option<RecordBatch>,
@@ -381,17 +401,11 @@ pub struct TursoReader {
 }
 
 impl TursoReader {
-    fn new(
-        runtime: db::Runtime,
-        rows: Option<Rows>,
-        schema: SchemaRef,
-        first: Vec<Vec<Value>>,
-    ) -> Result<Self> {
+    fn new(rows: Option<Rows>, schema: SchemaRef, first: Vec<Vec<Value>>) -> Result<Self> {
         let batch = (!first.is_empty())
             .then(|| types::build_batch(&schema, &first, 0))
             .transpose()?;
         Ok(Self {
-            runtime,
             rows,
             schema,
             first: batch,
@@ -403,16 +417,12 @@ impl TursoReader {
         if let Some(batch) = self.first.take() {
             return Ok(Some(batch));
         }
-        let Some(mut rows) = self.rows.take() else {
+        let Some(rows) = self.rows.as_mut() else {
             return Ok(None);
         };
-        let (rows, fetched) = self.runtime.run(async move {
-            let fetched = rows.next_rows(BATCH_ROWS, BATCH_BYTES).await;
-            (rows, fetched)
-        })?;
-        let (fetched, done) = fetched?;
-        if !done {
-            self.rows = Some(rows);
+        let (fetched, done) = rows.next_rows(BATCH_ROWS, BATCH_BYTES)?;
+        if done {
+            self.rows = None;
         }
         if fetched.is_empty() {
             return Ok(None);

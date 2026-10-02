@@ -18,7 +18,7 @@ use grainlift_server::config::TargetConfig;
 
 fn target() -> TargetConfig {
     TargetConfig {
-        driver: "grainlift-turso".into(),
+        driver: grainlift_turso::DEV_TARGET.into(),
         entrypoint: None,
         database_options: Vec::new(),
         connection_options: Vec::new(),
@@ -501,5 +501,27 @@ fn ingests_into_temporary_tables() {
     assert!(
         query(&mut *connection, "SELECT * FROM main.scratch").is_err(),
         "the table is temporary, not in main"
+    );
+}
+
+#[test]
+fn two_targets_cannot_share_a_database_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("shared.db");
+    let path = path.to_str().unwrap();
+    let spec = |read_only| {
+        grainlift_turso::TargetSpec::new(grainlift_turso::Location::parse(path, None, read_only))
+    };
+    let error = grainlift_turso::TursoBackend::new([
+        ("writer".to_string(), spec(false)),
+        ("reader".to_string(), spec(true)),
+    ])
+    .err()
+    .unwrap();
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert!(
+        error.message.contains("same database file"),
+        "{}",
+        error.message
     );
 }

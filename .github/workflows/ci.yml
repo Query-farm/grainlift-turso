@@ -89,3 +89,59 @@ jobs:
           kill "$server"
           grep -q 'Oslo' "$RUNNER_TEMP/example.out"
           grep -q '710000' "$RUNNER_TEMP/example.out"
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.97.1
+      - name: Fail on dependencies with known vulnerabilities
+        # Unmaintained and unsound warnings are reported but do not fail; see
+        # the README's "Dependencies" section for the accepted ones.
+        run: |
+          cargo install --locked cargo-audit
+          cargo audit
+
+  container:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the image
+        run: docker build --tag grainlift-turso:ci .
+      - name: Serve, probe and stop
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/turso.toml" <<'TOML'
+          [server]
+          listen = "0.0.0.0:8080"
+          allow_insecure_remote = true
+
+          [auth.static_bearer_tokens]
+          "ci-token" = "ci"
+
+          [targets.app]
+          url = "/var/lib/grainlift-turso/app.db"
+          TOML
+          docker run --rm --entrypoint grainlift-turso \
+            --volume "$RUNNER_TEMP/turso.toml:/etc/grainlift-turso/turso.toml:ro" \
+            grainlift-turso:ci check --config /etc/grainlift-turso/turso.toml
+          docker run --detach --name turso --publish 8080:8080 \
+            --volume "$RUNNER_TEMP/turso.toml:/etc/grainlift-turso/turso.toml:ro" grainlift-turso:ci
+          for _ in $(seq 50); do curl --silent --fail http://127.0.0.1:8080/healthz && break; sleep 0.2; done
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/healthz)" = 204
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/readyz)" = 204
+          test "$(docker exec turso id --user)" = 10001
+          docker stop --time 20 turso
+          test "$(docker inspect turso --format '{{.State.ExitCode}}')" = 0
+          docker logs turso 2>&1 | grep 'closed ADBC sessions during shutdown'
+          docker rm turso

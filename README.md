@@ -29,11 +29,13 @@
 > token or mTLS. A client may bring its own Turso token, which is never logged,
 > echoed in an error or readable back as an option. Read-only access is
 > enforced by Turso itself (a read-only token, or a file opened read-only), not
-> by inspecting SQL.
+> by inspecting SQL. Every Turso operation has a deadline and can be cancelled,
+> so a stuck query or an unresponsive network cannot wedge a session.
 
 ## Run
 
-The service serves one database, chosen by `TURSO_DATABASE_URL`:
+For development, the service serves one database, chosen by
+`TURSO_DATABASE_URL`, on loopback (for production, see [Production](#production)):
 
 ```bash
 # A local database file, opened in-process by the Turso Database engine
@@ -124,25 +126,112 @@ with dbapi.connect(
 The DB-API turns autocommit off, so that runs in a real Turso transaction
 until `commit()`.
 
+## Production
+
+`grainlift-turso serve` runs the production host from a configuration file,
+and `grainlift-turso check` validates the same file, reads its secrets and
+connects to every database without serving:
+
+```bash
+grainlift-turso check --config turso.toml
+grainlift-turso serve --config turso.toml
+```
+
+The file is Grainlift's own server configuration (`[server]`, `[auth]`,
+`[tcp]`, with the same fields, defaults and validation as the `grainlift-server`
+binary) plus one `[targets.NAME]` table per Turso database. Clients choose a
+database by its target name. [`turso.example.toml`](turso.example.toml) is an
+annotated example, and a test keeps it valid:
+
+```toml
+[server]
+listen = "127.0.0.1:8080"
+
+[auth.static_bearer_tokens]
+"replace-with-a-long-random-token" = "analytics"
+
+[auth.target_permissions]
+analytics = ["app"]
+
+[targets.app]
+url = "libsql://app-myorg.turso.io"
+auth_token_env = "TURSO_APP_TOKEN"     # or auth_token_file = "/run/secrets/turso"
+operation_timeout_seconds = 60
+
+[targets.reference]
+url = "/var/lib/grainlift-turso/reference.db"
+read_only = true
+```
+
+| Target setting | Default | |
+|---|---|---|
+| `url` | | A `libsql://` or `https://` Turso Cloud URL, or a local file |
+| `auth_token_env`, `auth_token_file` | | Where the Turso Cloud token comes from. Tokens never live in the file. |
+| `allow_client_auth_token` | `false` | Let clients send their own Turso token (see [Authentication](#authentication)) |
+| `read_only` | `false` | Open a local file read-only. Two targets may not share a file. |
+| `operation_timeout_seconds` | `60` | Longest one operation may run. Must be shorter than `server.driver_operation_timeout_seconds`. |
+| `busy_timeout_ms` | `5000` | How long a local write waits for another writer's lock |
+
+The host provides what `grainlift-server` does: static bearer tokens or JWT
+validation (`[auth.jwt]`), OAuth discovery for browser and CLI sign-in
+(`[auth.oauth]`), per-principal target permissions, an optional raw TCP or mTLS
+listener (`[tcp]`), CORS, session limits and idle expiry, and graceful
+shutdown. On SIGTERM it stops accepting work, closes every session and drains
+within `server.shutdown_grace_seconds`. Iroh is not offered.
+
+| Endpoint | |
+|---|---|
+| `GET /healthz` | `204` while the process serves |
+| `GET /readyz` | `204` once every database answers a query, `503` otherwise |
+
+**Logging and tracing.** Logs go to stderr, filtered by `RUST_LOG`, as text or,
+with `GRAINLIFT_TURSO_LOG_FORMAT=json`, one JSON object per line. Traces are
+exported over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Neither ever
+contains SQL, values or credentials.
+
+**Container.** The [`Dockerfile`](Dockerfile) builds a slim image that runs as
+an unprivileged user (uid 10001) and serves `/etc/grainlift-turso/turso.toml`:
+
+```bash
+docker build -t grainlift-turso .
+docker run -p 8080:8080 -e TURSO_APP_TOKEN \
+  -v ./turso.toml:/etc/grainlift-turso/turso.toml:ro grainlift-turso
+```
+
+Inside a container the configuration must listen on `0.0.0.0` with
+`allow_insecure_remote = true`, behind a load balancer or sidecar that
+terminates TLS: like `grainlift-server`, the HTTP listener is plaintext.
+
+**One process per set of clients.** Sessions, open transactions and open
+results live in the process that created them, so route every request from a
+client to the same process (sticky sessions). Scale out by sharding clients,
+not by load-balancing requests.
+
 ## How it reaches Turso
 
-Turso ships two Rust clients with nearly the same API, and this service uses
-both, behind one small interface in [`src/db.rs`](src/db.rs):
+Turso's Rust crates cover both kinds of database, behind one synchronous
+interface in [`src/db.rs`](src/db.rs):
 
-| `TURSO_DATABASE_URL` | Client | What it is |
+| URL | Client | What it is |
 |---|---|---|
-| a path, `file:` path or `:memory:` | [`turso`](https://crates.io/crates/turso) | The Turso Database engine itself, in process: a rewrite of SQLite in Rust |
+| a path, `file:` path or `:memory:` | [`turso_sdk_kit`](https://crates.io/crates/turso_sdk_kit) | The Turso Database engine itself, in process: a rewrite of SQLite in Rust |
 | `libsql://`, `https://`, `http://` | [`turso_serverless`](https://crates.io/crates/turso_serverless) | Turso Cloud over its SQL-over-HTTP protocol |
+
+The local engine is driven through `turso_sdk_kit`, the layer beneath the
+`turso` crate, because it exposes what a server needs and `turso` hides:
+interrupting a running statement, and a busy timeout for concurrent writers.
+Its synchronous mode also suits Grainlift's synchronous backend traits, so a
+local query runs on the calling thread with no async runtime in between.
 
 Rust is the natural fit on both sides: Turso's engine and clients are Rust
 crates, and Grainlift's reference server library, `grainlift-server`, is Rust
 and lives beside the native driver in the same repository. Nothing crosses an
 FFI boundary between the database and the Arrow batches.
 
-Grainlift's backend traits are synchronous and can be called from inside
-Grainlift's own Tokio runtime, while both Turso clients are async. Every Turso
-call therefore runs on a runtime owned by the backend, and the calling thread
-waits with a runtime-agnostic executor rather than nesting runtimes.
+`turso_serverless` is async, and Grainlift may call a backend from inside its
+own Tokio runtime, so Turso Cloud requests run on a runtime owned by the
+backend while the calling thread waits with a runtime-agnostic executor rather
+than nesting runtimes.
 
 ## Surface
 
@@ -154,7 +243,8 @@ waits with a runtime-agnostic executor rather than nesting runtimes.
 | Transactions | Turn off `adbc.connection.autocommit`; the next statement opens a transaction that lasts until commit or rollback. |
 | Bulk ingestion | `adbc.ingest.target_table` in the `create`, `append`, `replace` and `create_append` modes, plus `adbc.ingest.temporary`. Each ingestion is atomic. |
 | Metadata | `GetObjects`, `GetTableSchema`, `GetTableTypes` and `GetInfo`, laid out like the ADBC SQLite driver's: one catalog, `main`, holding one unnamed schema. |
-| Not implemented | Partitions, Substrait, statistics and cancellation return ADBC `NOT_IMPLEMENTED`. |
+| Cancellation | `AdbcStatementCancel` and `AdbcConnectionCancel` stop the running operation; it fails with ADBC `CANCELLED`. |
+| Not implemented | Partitions, Substrait and statistics return ADBC `NOT_IMPLEMENTED`. |
 
 ### Column types
 
@@ -191,6 +281,40 @@ Ingestion declares each column so that it reads back as the same Arrow type;
 decimals, dates and times read back as text.
 
 ## Design notes
+
+**Every operation has a deadline and can be cancelled.** Grainlift runs each
+session's calls on one worker thread, and its own operation timeout only stops
+*waiting*: the stuck call keeps running and the session stays wedged behind it.
+So each Turso operation here (an execute, one fetched batch, one catalog query)
+gets its own deadline, `operation_timeout_seconds`, and a cancel request from
+the client stops whichever operation is running ([`src/ops.rs`](src/ops.rs)).
+The local engine is interrupted at its next step, like `sqlite3_interrupt`;
+a Turso Cloud request is simply dropped, which aborts it. Both fail with a
+structured ADBC `TIMEOUT` or `CANCELLED`, and the connection stays usable.
+
+An interrupt applies to the whole local connection, as `sqlite3_interrupt`
+does, so it also closes that connection's other open results (they then report
+that they were closed); otherwise the engine's interrupt flag would stay set
+and fail every later statement on the connection.
+
+The deadline is per operation, not per result, so a client reading a large
+result slowly is never cut off between batches. That is also why the engine's
+own per-statement timeout is not used: it starts at a statement's first step
+and would interrupt a slow reader.
+
+**Read-only local files are enforced twice.** Turso shares one open database
+per path within a process and ignores a second opener's read-only flag, so a
+read-only target opened while the same file was open read-write elsewhere in
+the process could accept writes (a test caught this). The file is opened
+read-only, every connection also runs `PRAGMA query_only = 1`, and two targets
+may not use the same file.
+
+**Memory is bounded on both sides.** Results stream in bounded batches. Bound
+parameters stay as Arrow and are converted to Turso values one batch at a time
+while the statement runs, so a large binding costs its Arrow size plus one
+batch; Grainlift caps the Arrow size itself (`server.max_bind_bytes`). A bound
+stream is read during execution, once. Catalog queries refuse results beyond
+100,000 rows instead of holding them.
 
 **Turso Cloud results stream; they are not buffered.** `turso_serverless` reads
 a query's whole HTTP response before returning a row. Outside a transaction,
@@ -257,7 +381,9 @@ and SQLSTATEs, so clients can tell a bad query from a lost connection:
 | constraint violation | `INTEGRITY` | `23000` |
 | read-only token or file | `UNAUTHORIZED` | `25006` |
 | rejected or expired Turso token | `UNAUTHENTICATED` | `28000` |
-| busy | `TIMEOUT` | `40001` |
+| busy (another writer held the lock past `busy_timeout_ms`) | `TIMEOUT` | `40001` |
+| operation deadline expired | `TIMEOUT` | `HYT00` |
+| cancelled | `CANCELLED` | `HY008` |
 | network failure | `IO` | `58000` |
 | value does not fit its column | `INVALID_DATA` | `22000` |
 
@@ -265,7 +391,8 @@ and SQLSTATEs, so clients can tell a bad query from a lost connection:
 
 Two separate credentials are involved, and neither substitutes for the other.
 
-**Clients to this service.** The development host binds to loopback and
+**Clients to this service.** In production, `[auth]` configures it (see
+[Production](#production)). The development host binds to loopback and
 requires a bearer token by default; mTLS and anonymous access are options:
 
 ```bash
@@ -276,16 +403,14 @@ cargo run --release -- --host mtls --port 8443 \
 ```
 
 `--auth anonymous` also admits clients without a token, as one shared
-principal. Use it only for a read-only database. For production, host
-`TursoBackend` with `grainlift_server`'s session manager, limits and listeners
-behind HTTPS; see Grainlift's
+principal. Use it only for a read-only database. See also Grainlift's
 [security guide](https://github.com/Query-farm/grainlift/blob/main/docs/security.md).
-Sessions, transactions and open results belong to one process, so route every
-request from a client to the same process.
 
-**This service to Turso Cloud.** `TURSO_AUTH_TOKEN` gives the service its own
-token. Alternatively, or as well, each client can send its own token in the
-`turso.auth_token` database option, which the driver forwards:
+**This service to Turso Cloud.** A target's `auth_token_env` or
+`auth_token_file` (`TURSO_AUTH_TOKEN` for the development host) gives the
+service its own token. Alternatively, or as well, with `allow_client_auth_token`
+each client can send its own token in the `turso.auth_token` database option,
+which the driver forwards:
 
 ```sql
 CREATE SECRET turso (TYPE adbc, DRIVER '...', URI 'http://127.0.0.1:8080', SCOPE 'http://127.0.0.1:8080',
@@ -295,18 +420,24 @@ CREATE SECRET turso (TYPE adbc, DRIVER '...', URI 'http://127.0.0.1:8080', SCOPE
 
 That client's connection then authenticates as that token, so Turso applies
 its permissions: a read-only token gets a read-only connection, and its writes
-fail with `UNAUTHORIZED`. With `TURSO_AUTH_TOKEN` unset, every client must send
-one. Use database tokens (`turso db tokens create <db>` or `turso group tokens
+fail with `UNAUTHORIZED`. When the target has no token of its own, every
+client must send one. Use database tokens (`turso db tokens create <db>` or `turso group tokens
 create <group>`), not Platform API tokens. The token travels with each
 connection, so serve HTTPS or mTLS anywhere but loopback.
 
-For a local file, `GRAINLIFT_TURSO_READ_ONLY=true` opens it read-only.
+For a local file, `read_only = true` (`GRAINLIFT_TURSO_READ_ONLY=true` for the
+development host) opens it read-only.
 
 ## Limitations
 
-- **No cancellation.** The `turso` crate exposes no way to interrupt a running
-  query.
-- **One database per process,** served as the target `turso`.
+- **A local file has one writer at a time,** as in SQLite. Concurrent writers
+  wait up to `busy_timeout_ms` for the lock, and Turso's busy handler retries
+  on a timer rather than queueing writers fairly, so under heavy write
+  contention a writer can still fail with a retryable busy `TIMEOUT`. Clients
+  should retry those; nothing the failed statement attempted is committed. A
+  32-client, two-minute soak test exercises exactly this.
+- **An interrupted statement inside a transaction** may leave the transaction
+  open or rolled back, as in SQLite; roll back and retry.
 - **Idle Turso Cloud transactions expire** with their server-side stream.
 - **`TEMP` tables are invisible to streamed Cloud queries,** which run on their
   own stream (see above).
@@ -335,6 +466,9 @@ Never commit a path override for a local checkout.
 | File | |
 |---|---|
 | [`src/db.rs`](src/db.rs) | One interface over both Turso clients, the shared runtime, error mapping |
+| [`src/ops.rs`](src/ops.rs) | Per-operation deadlines and cancellation |
+| [`src/config.rs`](src/config.rs) | The production configuration file |
+| [`src/host.rs`](src/host.rs) | The production host: listeners, authentication, health, shutdown, logging |
 | [`src/cursor.rs`](src/cursor.rs) | Streamed Turso Cloud results from the cursor endpoint |
 | [`src/types.rs`](src/types.rs) | Turso values to Arrow, Arrow parameters to Turso, SQL parameter numbering |
 | [`src/statement.rs`](src/statement.rs) | Queries, updates, binding, ingestion |
@@ -350,10 +484,21 @@ cargo test --locked
 
 | Suite | Tests | Runs against |
 |---|---|---|
-| unit (`src/`) | 9 | type mapping, parameter numbering, metadata builders |
-| [`tests/backend.rs`](tests/backend.rs) | 13 | the backend, called directly, on local database files |
+| unit (`src/`) | 18 | type mapping, parameter numbering, configuration, deadlines, error wording |
+| [`tests/backend.rs`](tests/backend.rs) | 14 | the backend, called directly, on local database files |
+| [`tests/limits.rs`](tests/limits.rs) | 9 | deadlines and cancellation (local and Turso Cloud), slow readers, concurrent writers, lazily read bindings |
 | [`tests/native.rs`](tests/native.rs) | 5 | the native driver over HTTP, through the C ABI |
+| [`tests/host.rs`](tests/host.rs) | 3 | the production host and the `serve` and `check` commands, including SIGTERM |
+| [`tests/soak.rs`](tests/soak.rs) | 1 | many concurrent clients doing mixed work; exact totals and no leaked sessions |
 | [`tests/cloud.rs`](tests/cloud.rs) | 4 | a real Turso Cloud database |
+
+The Turso Cloud deadline and cancellation tests use a local server that
+accepts connections and never answers. The soak test runs for
+`GRAINLIFT_TURSO_SOAK_SECONDS` (default 5) with `GRAINLIFT_TURSO_SOAK_CLIENTS`
+clients (default 12). A 32-client, two-minute run did 17,424 operations and
+committed 350,995 rows, exactly as counted; 4 writes were abandoned as busy and
+retried correctly, and the whole test process (server and clients) peaked at
+273 MB.
 
 The native tests skip unless `GRAINLIFT_DRIVER` names the driver library; set
 `GRAINLIFT_REQUIRE_NATIVE=1` to fail instead. The Cloud tests skip unless
@@ -367,9 +512,21 @@ their own tables.
 Linux and macOS. It checks formatting and Clippy, builds the native driver from
 the revision pinned in `Cargo.lock`, and runs every suite with
 `GRAINLIFT_REQUIRE_NATIVE=1`. The Cloud suite runs when the repository's
-`TURSO_TEST_*` secrets are set. Finally it starts the service and runs
+`TURSO_TEST_*` secrets are set. It then starts the service and runs
 [`examples/query.sql`](examples/query.sql) through the Haybarn CLI, so the
-example in this README is checked against a live service.
+example in this README is checked against a live service. Separate jobs build
+the container image and probe a running container (health, readiness, the
+unprivileged user, a clean `docker stop`), and run `cargo audit`, which fails
+on any dependency with a known vulnerability.
+
+## Dependencies
+
+`cargo audit` currently reports no vulnerabilities and three warnings, all in
+transitive dependencies and accepted: `bincode` 1 (unmaintained, via
+VGI-RPC), `paste` (unmaintained, via Iroh's networking in `grainlift-server`),
+and `lru` 0.16 (`RUSTSEC-2026-0253`, unsound `LruCache::pop` under a panic),
+which arrives through `tantivy`, the engine behind Turso's full-text search.
+Dropping it would remove full-text search.
 
 ## License
 

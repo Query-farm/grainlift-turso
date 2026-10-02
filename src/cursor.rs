@@ -33,12 +33,21 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub fn new(url: &str, auth_token: Option<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    /// An endpoint for `url`. Connecting is bounded here; each request is
+    /// bounded by its operation's deadline (see [`crate::ops`]).
+    pub fn new(url: &str, auth_token: Option<String>) -> adbc_core::error::Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|failure| {
+                http_failure(format!("could not create the HTTP client: {failure}"))
+            })?;
+        Ok(Self {
+            client,
             url: protocol_url(url),
             auth_token,
-        }
+        })
     }
 
     async fn post(&self, base_url: &str, path: &str, body: String) -> Result<reqwest::Response> {
