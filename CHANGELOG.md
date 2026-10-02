@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-10-02)
 
 The first release: a Grainlift ADBC service for Turso databases.
 
@@ -38,7 +38,9 @@ The first release: a Grainlift ADBC service for Turso databases.
   writers.
 - `/healthz` and `/readyz`, graceful SIGTERM drain, text or JSON logs, OTLP
   tracing.
-- A Dockerfile for a non-root container image.
+- Release binaries for Linux (x86_64, ARM64), macOS (Apple Silicon, Intel)
+  and Windows, and a multi-architecture container image,
+  `ghcr.io/query-farm/grainlift-turso`, running as a non-root user.
 
 ### Turso Cloud's Turso Database engine
 

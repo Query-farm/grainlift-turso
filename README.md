@@ -60,10 +60,12 @@ It works with both kinds of Turso database:
 
 ## How it works
 
-```
-DuckDB, Python, ...  ──▶  Grainlift ADBC driver  ──▶  grainlift-turso  ──▶  Turso
-   your tools             (a library your tool loads)    (this server)        Cloud or local file
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works-dark.svg">
+    <img src="docs/how-it-works-light.svg" alt="Your tools load the Grainlift ADBC driver, which connects over HTTPS or mutual TLS to grainlift-turso on your server, which runs your SQL on Turso Cloud or a local Turso database file." width="100%">
+  </picture>
+</p>
 
 Your tool loads the Grainlift ADBC driver
 ([`pip install adbc-driver-grainlift`](https://pypi.org/project/adbc-driver-grainlift/)),
@@ -72,30 +74,48 @@ on Turso as written and streams the results back.
 
 ## Quick start
 
-This takes about five minutes and needs Python 3.13 or newer (for the driver),
-[Rust](https://rustup.rs) 1.97 or newer (to build the server) and
-[uv](https://docs.astral.sh/uv/) (to run Haybarn, a DuckDB distribution).
+This takes about five minutes. You need Python 3.13 or newer (for the driver)
+and [uv](https://docs.astral.sh/uv/) (to run Haybarn, a DuckDB distribution).
 
-**1. Install the Grainlift driver** from PyPI, and note where its library is:
+**1. Download grainlift-turso** for your platform from the
+[latest release](https://github.com/Query-farm/grainlift-turso/releases/latest)
+and unpack it. For example, on a Mac with Apple Silicon:
+
+```bash
+curl -L https://github.com/Query-farm/grainlift-turso/releases/latest/download/grainlift-turso-aarch64-apple-darwin.tar.gz | tar xz
+cd grainlift-turso-aarch64-apple-darwin
+```
+
+| Platform | Download |
+|---|---|
+| Linux, x86_64 | `grainlift-turso-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux, ARM64 | `grainlift-turso-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS, Apple Silicon | `grainlift-turso-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `grainlift-turso-x86_64-apple-darwin.tar.gz` |
+| Windows, x86_64 | `grainlift-turso-x86_64-pc-windows-msvc.zip` |
+
+Each release lists SHA-256 checksums in `SHA256SUMS`. (Prefer containers?
+`ghcr.io/query-farm/grainlift-turso` is the same program; see
+[Running it in production](#running-it-in-production).)
+
+**2. Install the Grainlift driver** from PyPI, and note where its library is:
 
 ```bash
 pip install adbc-driver-grainlift
 export GRAINLIFT_DRIVER=$(python -c "import adbc_driver_grainlift; print(adbc_driver_grainlift.driver_path())")
 ```
 
-**2. Start grainlift-turso** on a new local database file:
+**3. Start grainlift-turso** on a new local database file:
 
 ```bash
-git clone https://github.com/Query-farm/grainlift-turso.git
-cd grainlift-turso
 export GRAINLIFT_TOKEN=choose-a-secret
-TURSO_DATABASE_URL=demo.db cargo run --release
+TURSO_DATABASE_URL=demo.db ./grainlift-turso
 ```
 
 It prints `Grainlift listening on http://127.0.0.1:8080`. Leave it running.
 
-**3. Query it from DuckDB.** In a second terminal (with the same two
-`export`s), run the [example](examples/query.sql), which loads a table into
+**4. Query it from DuckDB.** In a second terminal, in the same directory and
+with the same two `export`s, run the included example, which loads a table into
 Turso, updates it, and joins it with local data:
 
 ```bash
@@ -177,7 +197,7 @@ Point the server at your database's URL and give it a
 ```bash
 export TURSO_DATABASE_URL=libsql://my-db-my-org.turso.io
 export TURSO_AUTH_TOKEN=$(turso db tokens create my-db)
-cargo run --release
+./grainlift-turso
 ```
 
 Prefer to have each person use their own Turso token, so Turso applies their
@@ -206,12 +226,19 @@ grainlift-turso check --config turso.toml    # validates the file and connects t
 grainlift-turso serve --config turso.toml
 ```
 
+Or run the container image, for Linux on x86_64 or ARM64:
+
+```bash
+docker run -p 8080:8080 -e TURSO_APP_TOKEN \
+  -v ./turso.toml:/etc/grainlift-turso/turso.toml:ro \
+  ghcr.io/query-farm/grainlift-turso:latest
+```
+
 One server can serve many databases, each with its own settings, and supports
 single sign-on (JWT), mutual TLS, per-user database permissions, health checks,
-JSON logs, tracing and graceful shutdown. A [`Dockerfile`](Dockerfile) builds a
-small container image. The **[deployment guide](docs/deployment.md)** covers
-all of it, and [`turso.example.toml`](turso.example.toml) is a complete,
-annotated example.
+JSON logs, tracing and graceful shutdown. The
+**[deployment guide](docs/deployment.md)** covers all of it, and
+[`turso.example.toml`](turso.example.toml) is a complete, annotated example.
 
 ## What you can do
 
@@ -254,7 +281,7 @@ table list when you attach. Detach and attach again.
   health checks, logging, containers and scaling.
 - [How it works](docs/how-it-works.md): architecture, type mapping, design
   decisions, error codes and limitations.
-- [Development](docs/development.md): building, testing and CI.
+- [Development](docs/development.md): building from source, testing and CI.
 - [Changelog](CHANGELOG.md)
 
 ## License

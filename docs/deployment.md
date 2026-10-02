@@ -133,14 +133,19 @@ values or credentials.
 
 ## Containers
 
-The [`Dockerfile`](../Dockerfile) builds a slim image that runs as an
-unprivileged user (uid 10001) and serves `/etc/grainlift-turso/turso.toml`:
+Each release publishes a multi-architecture image (Linux on x86_64 and ARM64)
+that runs as an unprivileged user (uid 10001) and serves
+`/etc/grainlift-turso/turso.toml`:
 
 ```bash
-docker build -t grainlift-turso .
 docker run -p 8080:8080 -e TURSO_APP_TOKEN \
-  -v ./turso.toml:/etc/grainlift-turso/turso.toml:ro grainlift-turso
+  -v ./turso.toml:/etc/grainlift-turso/turso.toml:ro \
+  ghcr.io/query-farm/grainlift-turso:latest
 ```
+
+Tags: `latest`, each version (`0.1.0`), and each minor series (`0.1`). To build
+the image from source instead, use the [`Dockerfile`](../Dockerfile):
+`docker build -t grainlift-turso .`
 
 Inside a container, the configuration must listen on `0.0.0.0` with
 `allow_insecure_remote = true`. The HTTP listener is plaintext (as in

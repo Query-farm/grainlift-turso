@@ -66,6 +66,7 @@ jobs:
           binary=grainlift-turso
           [ "${{ matrix.archive }}" = zip ] && binary=grainlift-turso.exe
           cp "target/${{ matrix.target }}/release/$binary" README.md LICENSE NOTICE CHANGELOG.md turso.example.toml "dist/$name/"
+          mkdir "dist/$name/examples" && cp examples/query.sql "dist/$name/examples/"
           cd dist
           if [ "${{ matrix.archive }}" = zip ]; then
             7z a -tzip "$name.zip" "$name" > /dev/null

@@ -1,8 +1,16 @@
 # Developing grainlift-turso
 
-## Building and checking
+## Building from source
 
-Requires Rust 1.97 or newer.
+Releases provide ready-made binaries and a container image (see the
+[README](../README.md#quick-start)). To build it yourself, you need Rust 1.97
+or newer:
+
+```bash
+cargo build --release --locked      # target/release/grainlift-turso
+```
+
+## Checking
 
 ```bash
 git clone https://github.com/Query-farm/grainlift-turso
@@ -85,3 +93,18 @@ writes were abandoned as busy and retried correctly, and the whole test process
 - **Container image**: builds the image and probes a running container
   (health, readiness, the unprivileged user, a clean `docker stop`).
 - **Dependency audit**: `cargo audit`, failing on any known vulnerability.
+
+## Releasing
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) publishes a
+release when a `vX.Y.Z` tag matching the crate's version is pushed:
+
+1. Set `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`,
+   and give `CHANGELOG.md` a `## X.Y.Z` section (it becomes the release notes).
+2. Commit, push, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+The workflow builds and smoke-tests binaries for Linux (x86_64, ARM64), macOS
+(Apple Silicon, Intel) and Windows, publishes them with `SHA256SUMS` as a
+GitHub Release, and pushes `ghcr.io/query-farm/grainlift-turso` for Linux on
+x86_64 and ARM64. Running the workflow by hand (Actions → Release → Run
+workflow) does everything except publish.

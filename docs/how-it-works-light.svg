@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 320" width="1040" height="320" role="img" aria-label="Your tools load the Grainlift ADBC driver, which connects over the network to grainlift-turso, which runs your SQL on Turso Cloud or a local Turso database file.">
+<title>How grainlift-turso works</title>
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#818b98"/></marker></defs>
+<text x="115" y="40" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#59636e" text-anchor="middle">YOUR TOOLS</text>
+<rect x="20" y="58" width="190" height="66" rx="12" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="115" y="87" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="middle">DuckDB · Haybarn</text>
+<text x="115" y="107" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle">SQL, joins, ATTACH</text>
+<rect x="20" y="140" width="190" height="66" rx="12" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="115" y="169" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="middle">Python</text>
+<text x="115" y="189" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle">pandas · Polars · Arrow</text>
+<rect x="20" y="222" width="190" height="66" rx="12" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="115" y="251" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="middle">Go · Rust · Java · C++</text>
+<text x="115" y="271" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle">any ADBC driver manager</text>
+<text x="384" y="40" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#59636e" text-anchor="middle">INSIDE YOUR TOOL</text>
+<rect x="262" y="106" width="244" height="134" rx="12" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<path d="M212,91 C235.0,91 235.0,140 258,140" fill="none" stroke="#818b98" stroke-width="2" marker-end="url(#head)"/>
+<path d="M212,173 C235.0,173 235.0,173 258,173" fill="none" stroke="#818b98" stroke-width="2" marker-end="url(#head)"/>
+<path d="M212,255 C235.0,255 235.0,206 258,206" fill="none" stroke="#818b98" stroke-width="2" marker-end="url(#head)"/>
+<text x="384" y="148" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#1f2328" text-anchor="middle">Grainlift</text>
+<text x="384" y="168" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#1f2328" text-anchor="middle">ADBC driver</text>
+<rect x="270" y="186" width="228" height="30" rx="6" fill="#eff2f5"/>
+<text x="384" y="206" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" font-weight="400" fill="#1f2328" text-anchor="middle">pip install adbc-driver-grainlift</text>
+<path d="M508,173 C547.0,173 547.0,173 586,173" fill="none" stroke="#818b98" stroke-width="2" marker-end="url(#head)"/>
+<text x="547" y="160" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#59636e" text-anchor="middle">HTTPS</text>
+<text x="547" y="194" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#59636e" text-anchor="middle">or mTLS</text>
+<text x="706" y="40" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#59636e" text-anchor="middle">YOUR SERVER</text>
+<rect x="590" y="58" width="232" height="230" rx="12" fill="#f0f8f0" stroke="#2f7d32" stroke-width="2.5"/>
+<text x="706" y="96" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#1f5f22" text-anchor="middle">grainlift-turso</text>
+<circle cx="616" cy="124" r="3" fill="#2f7d32"/>
+<text x="628" y="128" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#1f2328" text-anchor="start">sign-in &amp; permissions</text>
+<circle cx="616" cy="150" r="3" fill="#2f7d32"/>
+<text x="628" y="154" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#1f2328" text-anchor="start">runs your SQL on Turso</text>
+<circle cx="616" cy="176" r="3" fill="#2f7d32"/>
+<text x="628" y="180" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#1f2328" text-anchor="start">streams typed Arrow results</text>
+<circle cx="616" cy="202" r="3" fill="#2f7d32"/>
+<text x="628" y="206" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#1f2328" text-anchor="start">bulk loading &amp; transactions</text>
+<circle cx="616" cy="228" r="3" fill="#2f7d32"/>
+<text x="628" y="232" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#1f2328" text-anchor="start">timeouts &amp; cancellation</text>
+<circle cx="616" cy="254" r="3" fill="#2f7d32"/>
+<text x="628" y="258" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#1f2328" text-anchor="start">health checks &amp; logs</text>
+<path d="M824,150 C848.0,150 848.0,106 872,106" fill="none" stroke="#818b98" stroke-width="2" marker-end="url(#head)"/>
+<path d="M824,196 C848.0,196 848.0,240 872,240" fill="none" stroke="#818b98" stroke-width="2" marker-end="url(#head)"/>
+<text x="948" y="40" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#59636e" text-anchor="middle">TURSO</text>
+<rect x="876" y="64" width="144" height="84" rx="12" fill="#ffffff" stroke="#1ebca1" stroke-width="2"/>
+<text x="948" y="99" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1f2328" text-anchor="middle">Turso Cloud</text>
+<text x="948" y="120" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle">libSQL or the</text>
+<text x="948" y="136" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle">Turso engine</text>
+<rect x="876" y="198" width="144" height="84" rx="12" fill="#ffffff" stroke="#1ebca1" stroke-width="2"/>
+<text x="948" y="233" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#1f2328" text-anchor="middle">Local file</text>
+<text x="948" y="254" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle">embedded Turso</text>
+<text x="948" y="270" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle">engine</text>
+</svg>
