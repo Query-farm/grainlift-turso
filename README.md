@@ -116,15 +116,15 @@ It prints `Grainlift listening on http://127.0.0.1:8080`. Leave it running.
 
 **4. Query it from DuckDB.** In a second terminal, in the same directory and
 with the same two `export`s, start Haybarn with `uvx haybarn-cli` and paste the
-SQL below. It loads a table into Turso, updates it, queries it, and joins it
-with local data. (It is also included as `examples/query.sql`:
-`uvx haybarn-cli < examples/query.sql` runs it in one go.)
+SQL below. It attaches the Turso database, creates a table in it from a DuckDB
+query, adds a row, and joins it with local data. (It is also included as
+`examples/query.sql`: `uvx haybarn-cli < examples/query.sql` runs it in one go.)
 
 ```sql
 FORCE INSTALL adbc_scanner FROM community;
 LOAD adbc_scanner;
 
--- One secret holds the connection, so ATTACH and the adbc_* functions share it.
+-- How to reach grainlift-turso: the driver, the server and a token.
 CREATE SECRET turso (
     TYPE adbc,
     DRIVER getenv('GRAINLIFT_DRIVER'),
@@ -135,37 +135,26 @@ CREATE SECRET turso (
         'grainlift.auth.bearer_token': getenv('GRAINLIFT_TOKEN')
     }
 );
-SET VARIABLE turso = (SELECT adbc_connect({'secret': 'turso'}));
 
--- Bulk-load a DuckDB query result into a new Turso table (ADBC ingestion).
-SELECT * FROM adbc_insert(getvariable('turso')::BIGINT, 'cities', (
+-- Attach the Turso database. READ_WRITE lets you create tables and insert.
+ATTACH 'http://127.0.0.1:8080' AS turso (TYPE adbc, SECRET 'turso', READ_WRITE);
+
+-- Create a Turso table from a DuckDB query, then add a row.
+CREATE TABLE turso.cities AS
     SELECT * FROM (VALUES
         ('Lima', 'PE', 10092000),
         ('Pune', 'IN', 7166000),
-        ('Rome', 'IT', 2873000),
-        ('Oslo', 'NO', 709000)
-    ) AS v(name, country, population)
-), mode := 'replace');
+        ('Rome', 'IT', 2873000)
+    ) AS v(name, country, population);
 
--- Run any statement in Turso; the result is the number of rows it changed.
-CALL adbc_execute(getvariable('turso')::BIGINT,
-    'UPDATE cities SET population = population + 1000 WHERE country = ''NO''');
+INSERT INTO turso.cities VALUES ('Oslo', 'NO', 709000);
 
--- adbc_scan sends the quoted SQL to Turso and returns typed Arrow batches.
-SELECT * FROM adbc_scan(getvariable('turso')::BIGINT,
-    'SELECT name, population FROM cities WHERE population > ? ORDER BY population DESC',
-    params := row(5000000));
-
--- Or attach the database and use its tables like local ones.
-ATTACH 'http://127.0.0.1:8080' AS t (TYPE adbc, SECRET 'turso');
-
+-- Query it like any table, joined here with local data.
 SELECT c.name, k.country, c.population
-FROM t.cities c
+FROM turso.cities c
 JOIN (VALUES ('PE', 'Peru'), ('IN', 'India'), ('IT', 'Italy'), ('NO', 'Norway')) AS k(code, country)
   ON c.country = k.code
 ORDER BY c.population DESC;
-
-CALL adbc_disconnect(getvariable('turso')::BIGINT);
 ```
 
 The last query prints:
@@ -178,7 +167,7 @@ The last query prints:
 │ Lima    │ Peru    │   10092000 │
 │ Pune    │ India   │    7166000 │
 │ Rome    │ Italy   │    2873000 │
-│ Oslo    │ Norway  │     710000 │
+│ Oslo    │ Norway  │     709000 │
 └─────────┴─────────┴────────────┘
 ```
 
@@ -186,9 +175,9 @@ The last query prints:
 
 ### From DuckDB
 
-Install the `adbc_scanner` extension, store the connection in a secret, and
-attach the database. Its tables then behave like local ones. `DRIVER` is the
-library path that `adbc_driver_grainlift.driver_path()` prints:
+Attach the database with `READ_WRITE`, and its tables behave much like local
+ones: query and join them, create them from queries, and insert into them.
+`DRIVER` is the library path that `adbc_driver_grainlift.driver_path()` prints:
 
 ```sql
 FORCE INSTALL adbc_scanner FROM community;
@@ -201,18 +190,28 @@ CREATE SECRET turso (
     SCOPE 'http://127.0.0.1:8080',
     EXTRA_OPTIONS MAP {'grainlift.target': 'turso', 'grainlift.auth.bearer_token': 'choose-a-secret'}
 );
+ATTACH 'http://127.0.0.1:8080' AS turso (TYPE adbc, SECRET 'turso', READ_WRITE);
 
-ATTACH 'http://127.0.0.1:8080' AS turso (TYPE adbc, SECRET 'turso');
 SELECT * FROM turso.cities WHERE population > 1000000;
+CREATE TABLE turso.sales AS SELECT * FROM 'sales.parquet';   -- loads in bulk
+INSERT INTO turso.sales SELECT * FROM 'more_sales.parquet';
 ```
 
-To run statements in Turso, or load data into it:
+Leave out `READ_WRITE` to attach read-only.
+
+DuckDB's attached databases cannot `UPDATE` or `DELETE` rows here, or run DDL
+such as `CREATE INDEX` or `DROP TABLE`: DuckDB changes rows by row ID, which
+remote tables do not have. Send those statements to Turso directly with
+`adbc_execute`, which reports the rows changed:
 
 ```sql
 SET VARIABLE conn = (SELECT adbc_connect({'secret': 'turso'}));
+CALL adbc_execute(getvariable('conn')::BIGINT, 'UPDATE cities SET population = population + 1000 WHERE country = ''NO''');
 CALL adbc_execute(getvariable('conn')::BIGINT, 'CREATE INDEX cities_country ON cities (country)');
-SELECT * FROM adbc_insert(getvariable('conn')::BIGINT, 'sales', (SELECT * FROM 'sales.parquet'), mode := 'create');
 ```
+
+A table created with `adbc_execute` appears in the attached database once you
+attach it again.
 
 Use [Haybarn](https://github.com/Query-farm-haybarn/haybarn) 1.5.5 or newer:
 the `adbc_scanner` that stock DuckDB currently downloads is too old to load
@@ -317,8 +316,12 @@ read-only Turso token, or a file served with `read_only = true`.
 values, which SQLite-style databases allow. Add a `CAST` in your query to
 choose the type you want.
 
-**`adbc_insert` hangs in DuckDB.** Your `adbc_scanner` extension is too old.
+**Loading data hangs in DuckDB.** Your `adbc_scanner` extension is too old.
 Run `FORCE INSTALL adbc_scanner FROM community;` in Haybarn 1.5.5 or newer.
+
+**"Can only update base table", or "do not support creating tables through
+DDL".** DuckDB's attached databases cannot update, delete or run DDL on remote
+tables; use `adbc_execute` (see [From DuckDB](#from-duckdb)).
 
 **A new table doesn't appear in an attached database.** DuckDB caches the
 table list when you attach. Detach and attach again.

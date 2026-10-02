@@ -4,14 +4,14 @@
 --   export GRAINLIFT_TOKEN=...      # the token grainlift-turso printed or was given
 --   uvx haybarn-cli < examples/query.sql
 --
--- The service must be running on port 8080 (see the README). This needs
--- adbc_scanner 2d696f8 or newer, which Haybarn 1.5.5 installs; FORCE INSTALL
--- replaces an older copy.
+-- The service must be running on port 8080 with a fresh database (see the
+-- README). This needs adbc_scanner 2d696f8 or newer, which Haybarn 1.5.5
+-- installs; FORCE INSTALL replaces an older copy.
 
 FORCE INSTALL adbc_scanner FROM community;
 LOAD adbc_scanner;
 
--- One secret holds the connection, so ATTACH and the adbc_* functions share it.
+-- How to reach grainlift-turso: the driver, the server and a token.
 CREATE SECRET turso (
     TYPE adbc,
     DRIVER getenv('GRAINLIFT_DRIVER'),
@@ -22,34 +22,23 @@ CREATE SECRET turso (
         'grainlift.auth.bearer_token': getenv('GRAINLIFT_TOKEN')
     }
 );
-SET VARIABLE turso = (SELECT adbc_connect({'secret': 'turso'}));
 
--- Bulk-load a DuckDB query result into a new Turso table (ADBC ingestion).
-SELECT * FROM adbc_insert(getvariable('turso')::BIGINT, 'cities', (
+-- Attach the Turso database. READ_WRITE lets you create tables and insert.
+ATTACH 'http://127.0.0.1:8080' AS turso (TYPE adbc, SECRET 'turso', READ_WRITE);
+
+-- Create a Turso table from a DuckDB query, then add a row.
+CREATE TABLE turso.cities AS
     SELECT * FROM (VALUES
         ('Lima', 'PE', 10092000),
         ('Pune', 'IN', 7166000),
-        ('Rome', 'IT', 2873000),
-        ('Oslo', 'NO', 709000)
-    ) AS v(name, country, population)
-), mode := 'replace');
+        ('Rome', 'IT', 2873000)
+    ) AS v(name, country, population);
 
--- Run any statement in Turso; the result is the number of rows it changed.
-CALL adbc_execute(getvariable('turso')::BIGINT,
-    'UPDATE cities SET population = population + 1000 WHERE country = ''NO''');
+INSERT INTO turso.cities VALUES ('Oslo', 'NO', 709000);
 
--- adbc_scan sends the quoted SQL to Turso and returns typed Arrow batches.
-SELECT * FROM adbc_scan(getvariable('turso')::BIGINT,
-    'SELECT name, population FROM cities WHERE population > ? ORDER BY population DESC',
-    params := row(5000000));
-
--- Or attach the database and use its tables like local ones.
-ATTACH 'http://127.0.0.1:8080' AS t (TYPE adbc, SECRET 'turso');
-
+-- Query it like any table, joined here with local data.
 SELECT c.name, k.country, c.population
-FROM t.cities c
+FROM turso.cities c
 JOIN (VALUES ('PE', 'Peru'), ('IN', 'India'), ('IT', 'Italy'), ('NO', 'Norway')) AS k(code, country)
   ON c.country = k.code
 ORDER BY c.population DESC;
-
-CALL adbc_disconnect(getvariable('turso')::BIGINT);
