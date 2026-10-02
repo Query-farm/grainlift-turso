@@ -367,8 +367,13 @@ fn column_values(array: &ArrayRef, name: &str) -> Result<Vec<Value>> {
 }
 
 /// The column type declared for an Arrow field by bulk ingestion. Reading the
-/// table back maps each declaration to the same Arrow type, except decimals,
-/// dates and times, which are stored and read back as text.
+/// table back maps each declaration to the same Arrow type, except that
+/// decimals read back as doubles and dates and times as text.
+///
+/// Decimals are bound as their exact text into a `NUMERIC` column, whose
+/// affinity stores each value as an integer or a double, so numeric
+/// comparisons and arithmetic work in Turso. (A `TEXT` column would keep the
+/// digits but make every comparison with a number textual.)
 pub fn column_declaration(data_type: &DataType) -> &'static str {
     match data_type {
         DataType::Boolean => "BOOLEAN",
@@ -378,6 +383,10 @@ pub fn column_declaration(data_type: &DataType) -> &'static str {
         | DataType::LargeBinary
         | DataType::BinaryView
         | DataType::FixedSizeBinary(_) => "BLOB",
+        DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..) => "NUMERIC",
         DataType::Dictionary(_, value_type) => column_declaration(value_type),
         _ => "TEXT",
     }

@@ -56,3 +56,8 @@ The first release: a Grainlift ADBC service for Turso databases.
 - Turso Cloud ingestion sends multi-row `INSERT`s in size-bounded requests:
   20,000 rows in 0.65 s instead of 4.0 s.
 - Bound parameters stay as Arrow and convert one batch at a time.
+
+### Types
+
+- Ingested decimals are stored as numbers (`NUMERIC`), so comparisons and
+  arithmetic work in Turso; they read back as doubles.

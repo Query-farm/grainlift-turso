@@ -525,3 +525,29 @@ fn two_targets_cannot_share_a_database_file() {
         error.message
     );
 }
+
+#[test]
+fn ingested_decimals_stay_numeric() {
+    let (backend, _directory) = common::local_backend();
+    let mut connection = connect(&backend);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "amount",
+        DataType::Decimal128(10, 2),
+        false,
+    )]));
+    let amounts = arrow_array::Decimal128Array::from(vec![15050_i64.into(), 4200, 99])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(amounts)]).unwrap();
+    let mut ingest = connection.new_statement().unwrap();
+    ingest
+        .set_option("adbc.ingest.target_table", OptionValue::from("sales"))
+        .unwrap();
+    ingest.bind(batch).unwrap();
+    assert_eq!(ingest.execute_update().unwrap(), Some(3));
+    // Numeric in Turso: comparisons and sums work on numbers, not text.
+    assert_eq!(count(&mut *connection, "sales WHERE amount > 100"), 1);
+    let batches = query(&mut *connection, "SELECT amount FROM sales ORDER BY amount").unwrap();
+    let amounts = batches[0].column(0).as_primitive::<Float64Type>();
+    assert_eq!(amounts.values(), &[0.99, 42.0, 150.5]);
+}
