@@ -19,13 +19,19 @@ use grainlift_server::backend::{Backend, BackendConnection};
 use grainlift_server::config::TargetConfig;
 use grainlift_turso::{Location, TursoBackend};
 
+/// A test setting from the environment. CI passes unset secrets as empty
+/// strings, which count as unset.
+fn setting(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 #[test]
 fn turso_cloud_round_trip() {
-    let Ok(url) = std::env::var("TURSO_TEST_DATABASE_URL") else {
+    let Some(url) = setting("TURSO_TEST_DATABASE_URL") else {
         eprintln!("skipped: TURSO_TEST_DATABASE_URL is not set");
         return;
     };
-    let location = Location::parse(&url, std::env::var("TURSO_TEST_AUTH_TOKEN").ok(), false);
+    let location = Location::parse(&url, setting("TURSO_TEST_AUTH_TOKEN"), false);
     assert!(
         location.is_remote(),
         "TURSO_TEST_DATABASE_URL must be a Turso Cloud URL"
@@ -118,10 +124,10 @@ fn client_supplied_tokens() {
     use adbc_core::error::Status;
     use adbc_core::{Connection, Statement};
 
-    let (Ok(url), Ok(token), Ok(read_only)) = (
-        std::env::var("TURSO_TEST_DATABASE_URL"),
-        std::env::var("TURSO_TEST_AUTH_TOKEN"),
-        std::env::var("TURSO_TEST_READ_ONLY_TOKEN"),
+    let (Some(url), Some(token), Some(read_only)) = (
+        setting("TURSO_TEST_DATABASE_URL"),
+        setting("TURSO_TEST_AUTH_TOKEN"),
+        setting("TURSO_TEST_READ_ONLY_TOKEN"),
     ) else {
         eprintln!(
             "skipped: TURSO_TEST_DATABASE_URL, _AUTH_TOKEN and _READ_ONLY_TOKEN are not all set"
@@ -182,11 +188,11 @@ fn client_supplied_tokens() {
 /// Ingestion splits large values across statements and requests.
 #[test]
 fn ingests_large_values() {
-    let Ok(url) = std::env::var("TURSO_TEST_DATABASE_URL") else {
+    let Some(url) = setting("TURSO_TEST_DATABASE_URL") else {
         eprintln!("skipped: TURSO_TEST_DATABASE_URL is not set");
         return;
     };
-    let location = Location::parse(&url, std::env::var("TURSO_TEST_AUTH_TOKEN").ok(), false);
+    let location = Location::parse(&url, setting("TURSO_TEST_AUTH_TOKEN"), false);
     let backend = TursoBackend::open(&location).unwrap();
     let mut connection = backend.open(&target(), Vec::new(), Vec::new()).unwrap();
     let table = format!("grainlift_turso_large_{}", std::process::id());
@@ -239,11 +245,11 @@ fn ingests_large_values() {
 fn streamed_and_transactional_queries() {
     use adbc_core::error::Status;
 
-    let Ok(url) = std::env::var("TURSO_TEST_DATABASE_URL") else {
+    let Some(url) = setting("TURSO_TEST_DATABASE_URL") else {
         eprintln!("skipped: TURSO_TEST_DATABASE_URL is not set");
         return;
     };
-    let location = Location::parse(&url, std::env::var("TURSO_TEST_AUTH_TOKEN").ok(), false);
+    let location = Location::parse(&url, setting("TURSO_TEST_AUTH_TOKEN"), false);
     let backend = TursoBackend::open(&location).unwrap();
     let mut connection = backend.open(&target(), Vec::new(), Vec::new()).unwrap();
     let read = |connection: &mut Box<dyn BackendConnection>, sql: &str| {
