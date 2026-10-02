@@ -57,6 +57,7 @@ cargo test --locked
 | [`tests/soak.rs`](../tests/soak.rs) | 1 | many concurrent clients doing mixed work; exact totals and no leaked sessions |
 | [`tests/cloud.rs`](../tests/cloud.rs) | 5 | a real Turso Cloud database, on either engine |
 | [`tests/concurrent.rs`](../tests/concurrent.rs) | 1 | concurrent transactions on the Turso Database engine: parallel writers, conflicts, rollbacks, schema changes |
+| [`tests/docs.rs`](../tests/docs.rs) | 1 | the README's quick-start SQL is exactly `examples/query.sql`, which CI runs against a live service |
 
 Some suites need outside resources and skip without them:
 

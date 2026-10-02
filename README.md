@@ -115,12 +115,60 @@ TURSO_DATABASE_URL=demo.db ./grainlift-turso
 It prints `Grainlift listening on http://127.0.0.1:8080`. Leave it running.
 
 **4. Query it from DuckDB.** In a second terminal, in the same directory and
-with the same two `export`s, run the included example, which loads a table into
-Turso, updates it, and joins it with local data:
+with the same two `export`s, start Haybarn with `uvx haybarn-cli` and paste the
+SQL below. It loads a table into Turso, updates it, queries it, and joins it
+with local data. (It is also included as `examples/query.sql`:
+`uvx haybarn-cli < examples/query.sql` runs it in one go.)
 
-```bash
-uvx haybarn-cli < examples/query.sql
+```sql
+FORCE INSTALL adbc_scanner FROM community;
+LOAD adbc_scanner;
+
+-- One secret holds the connection, so ATTACH and the adbc_* functions share it.
+CREATE SECRET turso (
+    TYPE adbc,
+    DRIVER getenv('GRAINLIFT_DRIVER'),
+    URI 'http://127.0.0.1:8080',
+    SCOPE 'http://127.0.0.1:8080',
+    EXTRA_OPTIONS MAP {
+        'grainlift.target': 'turso',
+        'grainlift.auth.bearer_token': getenv('GRAINLIFT_TOKEN')
+    }
+);
+SET VARIABLE turso = (SELECT adbc_connect({'secret': 'turso'}));
+
+-- Bulk-load a DuckDB query result into a new Turso table (ADBC ingestion).
+SELECT * FROM adbc_insert(getvariable('turso')::BIGINT, 'cities', (
+    SELECT * FROM (VALUES
+        ('Lima', 'PE', 10092000),
+        ('Pune', 'IN', 7166000),
+        ('Rome', 'IT', 2873000),
+        ('Oslo', 'NO', 709000)
+    ) AS v(name, country, population)
+), mode := 'replace');
+
+-- Run any statement in Turso; the result is the number of rows it changed.
+CALL adbc_execute(getvariable('turso')::BIGINT,
+    'UPDATE cities SET population = population + 1000 WHERE country = ''NO''');
+
+-- adbc_scan sends the quoted SQL to Turso and returns typed Arrow batches.
+SELECT * FROM adbc_scan(getvariable('turso')::BIGINT,
+    'SELECT name, population FROM cities WHERE population > ? ORDER BY population DESC',
+    params := row(5000000));
+
+-- Or attach the database and use its tables like local ones.
+ATTACH 'http://127.0.0.1:8080' AS t (TYPE adbc, SECRET 'turso');
+
+SELECT c.name, k.country, c.population
+FROM t.cities c
+JOIN (VALUES ('PE', 'Peru'), ('IN', 'India'), ('IT', 'Italy'), ('NO', 'Norway')) AS k(code, country)
+  ON c.country = k.code
+ORDER BY c.population DESC;
+
+CALL adbc_disconnect(getvariable('turso')::BIGINT);
 ```
+
+The last query prints:
 
 ```
 ┌─────────┬─────────┬────────────┐
