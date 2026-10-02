@@ -19,6 +19,16 @@ use grainlift_server::backend::{Backend, BackendConnection};
 use grainlift_server::config::TargetConfig;
 use grainlift_turso::{Location, TursoBackend};
 
+/// A suffix that keeps concurrent runs (CI's parallel jobs share one
+/// database) from colliding.
+fn unique() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or_default();
+    format!("{}_{nanos}", std::process::id())
+}
+
 /// A test setting from the environment. CI passes unset secrets as empty
 /// strings, which count as unset.
 fn setting(name: &str) -> Option<String> {
@@ -39,7 +49,7 @@ fn turso_cloud_round_trip() {
     let backend = TursoBackend::open(&location).unwrap();
     let target = target();
     let mut connection = backend.open(&target, Vec::new(), Vec::new()).unwrap();
-    let table = format!("grainlift_turso_test_{}", std::process::id());
+    let table = format!("grainlift_turso_test_{}", unique());
 
     let run = |connection: &mut Box<dyn BackendConnection>, sql: &str| {
         let mut statement = connection.new_statement().unwrap();
@@ -141,7 +151,7 @@ fn client_supplied_tokens() {
     let backend = TursoBackend::open(&Location::parse(&url, None, false)).unwrap();
     assert!(backend.requires_client_token(grainlift_turso::DEV_TARGET));
     let server = common::Server::start(backend, &[("test-token", "alice")], None);
-    let table = format!("grainlift_turso_client_{}", std::process::id());
+    let table = format!("grainlift_turso_client_{}", unique());
     let run = |turso_token: Option<&str>, sql: &str| {
         let extra = turso_token
             .map(|token| vec![("turso.auth_token", token)])
@@ -195,7 +205,7 @@ fn ingests_large_values() {
     let location = Location::parse(&url, setting("TURSO_TEST_AUTH_TOKEN"), false);
     let backend = TursoBackend::open(&location).unwrap();
     let mut connection = backend.open(&target(), Vec::new(), Vec::new()).unwrap();
-    let table = format!("grainlift_turso_large_{}", std::process::id());
+    let table = format!("grainlift_turso_large_{}", unique());
     // 40 rows of 256 KiB: 10 MiB, more than one request carries.
     let text = "x".repeat(256 * 1024);
     let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
@@ -281,7 +291,7 @@ fn streamed_and_transactional_queries() {
     let empty = read(&mut connection, "SELECT 1 AS x WHERE 0").unwrap();
     assert!(empty.iter().all(|batch| batch.num_rows() == 0));
 
-    let table = format!("grainlift_turso_stream_{}", std::process::id());
+    let table = format!("grainlift_turso_stream_{}", unique());
     let mut statement = connection.new_statement().unwrap();
     statement
         .set_sql_query(&format!("CREATE TABLE {table} (id INTEGER)"))
