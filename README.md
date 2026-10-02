@@ -9,7 +9,17 @@
 <p align="center">
   Query your <a href="https://turso.tech">Turso</a> databases from DuckDB, Python, Go, Rust<br>
   and any other tool that speaks <a href="https://arrow.apache.org/adbc/">ADBC</a>.<br>
-  Built on <a href="https://github.com/Query-farm/grainlift">Grainlift</a> by <a href="https://query.farm">🚜 Query.Farm</a>
+  Built on <a href="https://github.com/Query-farm/grainlift">Grainlift</a> by <a href="https://query.farm">Query.Farm</a>
+</p>
+
+<p align="center">
+  <sub>WORKS WITH</sub><br>
+  <a href="https://turso.tech">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/turso-logo-white.svg">
+      <img src="docs/turso-logo-dark.svg" alt="Turso" height="44">
+    </picture>
+  </a>
 </p>
 
 <p align="center">
@@ -55,22 +65,22 @@ DuckDB, Python, ...  ──▶  Grainlift ADBC driver  ──▶  grainlift-turs
    your tools             (a library your tool loads)    (this server)        Cloud or local file
 ```
 
-Your tool loads the [Grainlift ADBC driver](https://github.com/Query-farm/grainlift),
+Your tool loads the Grainlift ADBC driver
+([`pip install adbc-driver-grainlift`](https://pypi.org/project/adbc-driver-grainlift/)),
 which talks to grainlift-turso over the network. grainlift-turso runs your SQL
 on Turso as written and streams the results back.
 
 ## Quick start
 
-This takes about five minutes and needs [Rust](https://rustup.rs) 1.97 or newer
-(to build the driver and the server) and [uv](https://docs.astral.sh/uv/) (to
-run Haybarn, a DuckDB distribution).
+This takes about five minutes and needs Python 3.13 or newer (for the driver),
+[Rust](https://rustup.rs) 1.97 or newer (to build the server) and
+[uv](https://docs.astral.sh/uv/) (to run Haybarn, a DuckDB distribution).
 
-**1. Build the Grainlift driver** (once):
+**1. Install the Grainlift driver** from PyPI, and note where its library is:
 
 ```bash
-git clone --branch v0.4.2 https://github.com/Query-farm/grainlift.git
-(cd grainlift && cargo build --release --locked -p adbc-driver-grainlift)
-export GRAINLIFT_DRIVER=$PWD/grainlift/target/release/libadbc_driver_grainlift.dylib  # .so on Linux
+pip install adbc-driver-grainlift
+export GRAINLIFT_DRIVER=$(python -c "import adbc_driver_grainlift; print(adbc_driver_grainlift.driver_path())")
 ```
 
 **2. Start grainlift-turso** on a new local database file:
@@ -109,7 +119,8 @@ uvx haybarn-cli < examples/query.sql
 ### From DuckDB
 
 Install the `adbc_scanner` extension, store the connection in a secret, and
-attach the database. Its tables then behave like local ones:
+attach the database. Its tables then behave like local ones. `DRIVER` is the
+library path that `adbc_driver_grainlift.driver_path()` prints:
 
 ```sql
 FORCE INSTALL adbc_scanner FROM community;
@@ -142,24 +153,21 @@ data through Grainlift.
 ### From Python
 
 ```python
-import adbc_driver_manager.dbapi as dbapi
+from adbc_driver_grainlift import dbapi
 
-with dbapi.connect(
-    driver="/path/to/libadbc_driver_grainlift.dylib",
-    entrypoint="AdbcDriverGrainliftInit",
-    db_kwargs={
-        "grainlift.uri": "http://127.0.0.1:8080",
-        "grainlift.target": "turso",
-        "grainlift.auth.bearer_token": "choose-a-secret",
-    },
-) as conn, conn.cursor() as cur:
+with dbapi.connect(db_kwargs={
+    "grainlift.uri": "http://127.0.0.1:8080",
+    "grainlift.target": "turso",
+    "grainlift.auth.bearer_token": "choose-a-secret",
+}) as conn, conn.cursor() as cur:
     cur.execute("SELECT name, population FROM cities")
     table = cur.fetch_arrow_table()      # or cur.fetch_df() for pandas
 ```
 
-Install the driver manager with `pip install adbc-driver-manager pyarrow`. The
-same connection settings work from any ADBC driver manager, in Go, Rust, Java
-or C++.
+`pip install adbc-driver-grainlift pyarrow` provides everything this needs.
+From Go, Rust, Java or C++, load the same library (`driver_path()`) through
+that language's ADBC driver manager, with the entry point
+`AdbcDriverGrainliftInit` and the same `grainlift.*` settings.
 
 ### With Turso Cloud
 
@@ -261,6 +269,7 @@ This project is not affiliated with or endorsed by Turso.
 ---
 
 <p align="center">
+  <a href="https://query.farm"><img src="docs/query-farm-logo.svg" alt="Query.Farm" height="48"></a><br>
   Built with <a href="https://github.com/Query-farm/grainlift">Grainlift</a><br>
-  by <a href="https://query.farm">🚜 Query.Farm</a>
+  by <a href="https://query.farm">Query.Farm</a>
 </p>

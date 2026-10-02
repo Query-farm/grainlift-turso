@@ -54,7 +54,7 @@ Some suites need outside resources and skip without them:
 
 | Variable | Needed by |
 |---|---|
-| `GRAINLIFT_DRIVER` | the native, host and soak tests (path to the driver library); set `GRAINLIFT_REQUIRE_NATIVE=1` to fail instead of skipping |
+| `GRAINLIFT_DRIVER` | the native, host and soak tests (path to the driver library, such as `adbc_driver_grainlift.driver_path()` from the PyPI package); set `GRAINLIFT_REQUIRE_NATIVE=1` to fail instead of skipping |
 | `TURSO_TEST_DATABASE_URL`, `TURSO_TEST_AUTH_TOKEN`, `TURSO_TEST_READ_ONLY_TOKEN` | the Turso Cloud tests (either engine) |
 | `TURSO_TEST_TURSODB_URL`, `TURSO_TEST_TURSODB_AUTH_TOKEN` | the concurrent-transaction tests (a Turso Database engine database) |
 

@@ -20,6 +20,14 @@ here only to describe what this software connects to.
 
 ------------------------------------------------------------------------------
 
+Logos
+
+docs/turso-logo-dark.svg and docs/turso-logo-white.svg are Turso's logo, from
+Turso's logo kit (https://turso.tech/brand), unmodified. They are used only to
+say what this software works with, and remain Turso's trademarks.
+
+docs/query-farm-logo.svg is Query Farm LLC's logo.
+
 Grainlift logo
 
 docs/grainlift-logo.svg is copied from the Grainlift project

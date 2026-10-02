@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Query.Farm">
+  <title>Query.Farm — Strata Sun</title>
+  <!-- Explicit circular slices keep the mark round even in favicon renderers
+       that do not honor SVG clip paths. Boundaries land on whole pixels at
+       16px, 32px and 64px output sizes. -->
+  <circle cx="32" cy="32" r="32" fill="#7A5230"/>
+  <path d="M4.287 48A32 32 0 1 1 59.713 48Z" fill="#A9762E"/>
+  <path d="M0 32A32 32 0 0 1 64 32Z" fill="#D9A441"/>
+  <path d="M4.287 16A32 32 0 0 1 59.713 16Z" fill="#F0C877"/>
+</svg>
